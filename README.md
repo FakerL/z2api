@@ -1,8 +1,8 @@
-title: {{title}}
-emoji: {{emoji}}
-colorFrom: {{colorFrom}}
-colorTo: {{colorTo}}
-sdk: {{sdk}}
-sdk_version: "{{sdkVersion}}"
-app_file: main.py
-pinned: false
+---
+license: mit
+title: z2api
+sdk: docker
+emoji: 📚
+colorFrom: pink
+colorTo: red
+---
