@@ -1,5 +1,6 @@
 """
 Proxy handler for Z.AI API requests
+Updated: 2025-08-06
 """
 
 import json
@@ -44,10 +45,18 @@ class ProxyHandler:
         close_cnt = len(re.findall(r"</think>", text))
         if open_cnt > close_cnt:
             text += "</think>" * (open_cnt - close_cnt)
+        elif close_cnt > open_cnt:
+            # Remove extra closing tags from the end
+            extra_closes = close_cnt - open_cnt
+            for _ in range(extra_closes):
+                text = re.sub(r"</think>(?!</think>)(?![^<]*</think>)$", "", text, count=1)
         return text
 
     def transform_content(self, content: str) -> str:
         """Transform upstream HTML to <think> format"""
+        if not content:
+            return content
+            
         if settings.SHOW_THINK_TAGS:
             # Replace <details> with <think>
             content = re.sub(r"<details[^>]*>", "<think>", content)
@@ -140,13 +149,21 @@ class ProxyHandler:
     # Main streaming logic
     async def stream_proxy_response(self, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
         """Handle streaming proxy response"""
+        client = None
         try:
+            # Create a new client for this request
+            client = httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0, read=300.0),
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+                http2=True,
+            )
+            
             req_body, headers, cookie = await self._prepare_upstream(request)
             completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
             think_open = False  # Track if <think> tag is open
             current_phase = None
 
-            async with self.client.stream("POST", settings.UPSTREAM_URL, json=req_body, headers=headers) as response:
+            async with client.stream("POST", settings.UPSTREAM_URL, json=req_body, headers=headers) as response:
                 if response.status_code != 200:
                     await cookie_manager.mark_cookie_invalid(cookie)
                     error_chunk = {
@@ -260,8 +277,13 @@ class ProxyHandler:
                                         yield f"data: {json.dumps(think_chunk)}\n\n"
                                         think_open = True
 
-                                # Transform content
-                                transformed_content = self.transform_content(delta_content)
+                                # Transform content (but don't add extra <think> tags)
+                                if phase == "thinking" and settings.SHOW_THINK_TAGS:
+                                    # Don't transform thinking content to avoid duplicate tags
+                                    transformed_content = delta_content
+                                else:
+                                    transformed_content = self.transform_content(delta_content)
+                                
                                 if transformed_content:  # Only yield if there's content
                                     chunk = {
                                         "id": completion_id,
@@ -308,16 +330,27 @@ class ProxyHandler:
             }
             yield f"data: {json.dumps(error_chunk)}\n\n"
             yield "data: [DONE]\n\n"
+        finally:
+            if client:
+                await client.aclose()
 
     async def non_stream_proxy_response(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         """Handle non-streaming proxy response"""
+        client = None
         try:
+            # Create a new client for this request
+            client = httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0, read=300.0),
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+                http2=True,
+            )
+            
             req_body, headers, cookie = await self._prepare_upstream(request)
             thinking_buf = []
             answer_buf = []
             current_phase = None
 
-            async with self.client.stream("POST", settings.UPSTREAM_URL, json=req_body, headers=headers) as response:
+            async with client.stream("POST", settings.UPSTREAM_URL, json=req_body, headers=headers) as response:
                 if response.status_code != 200:
                     await cookie_manager.mark_cookie_invalid(cookie)
                     raise HTTPException(status_code=response.status_code, detail="Upstream API error")
@@ -358,13 +391,28 @@ class ProxyHandler:
                                 answer_buf.append(delta_content)
 
             # Combine thinking and answer content
+            final_text = ""
+            
             if settings.SHOW_THINK_TAGS and thinking_buf:
-                thinking_text = "<think>" + "".join(thinking_buf) + "</think>"
-                final_text = thinking_text + "".join(answer_buf)
+                # Don't add extra <think> tags, the content transformation will handle it
+                thinking_text = "".join(thinking_buf)
+                answer_text = "".join(answer_buf)
+                
+                # Manually add think tags without duplication
+                final_text = f"<think>{thinking_text}</think>{answer_text}"
             else:
                 final_text = "".join(answer_buf)
 
-            final_text = self.transform_content(final_text)
+            # Apply content transformation but avoid duplicate processing for thinking content
+            if not (settings.SHOW_THINK_TAGS and thinking_buf):
+                final_text = self.transform_content(final_text)
+            else:
+                # Only transform the answer part to avoid duplicating think tags
+                if answer_buf:
+                    answer_part = self.transform_content("".join(answer_buf))
+                    final_text = f"<think>{''.join(thinking_buf)}</think>{answer_part}"
+                else:
+                    final_text = f"<think>{''.join(thinking_buf)}</think>"
 
             return ChatCompletionResponse(
                 id=f"chatcmpl-{uuid.uuid4().hex[:29]}",
@@ -385,6 +433,9 @@ class ProxyHandler:
         except Exception as e:
             logger.error(f"Unexpected error in non-stream: {e}")
             raise HTTPException(status_code=500, detail="Internal server error")
+        finally:
+            if client:
+                await client.aclose()
 
     # FastAPI entry point
     async def handle_chat_completion(self, request: ChatCompletionRequest):
