@@ -63,10 +63,13 @@ class ProxyHandler:
         import uuid
         target_model = "0727-360B-API"
         
+        # Correctly serialize ChatMessage objects to dictionaries
+        messages_as_dicts = [msg.model_dump() for msg in request.messages]
+
         return {
             "stream": True,
             "model": target_model,
-            "messages": request.messages,
+            "messages": messages_as_dicts,
             "background_tasks": {
                 "title_generation": True,
                 "tags_generation": True
