@@ -24,76 +24,98 @@ logger = logging.getLogger(__name__)
 
 class ProxyHandler:
     def __init__(self):
+        # Configure httpx client for streaming support
+        # This client should ideally be managed by the application's lifespan,
+        # but for this class, we initialize it here.
+        # The key is NOT to close it after each request if the handler is reused.
         self.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(60.0, read=300.0),
+            timeout=httpx.Timeout(60.0, read=300.0),  # Longer read timeout for streaming
             limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
-            http2=True
+            http2=True  # Enable HTTP/2 for better streaming performance
         )
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        # This will be called when the 'with' block exits.
+        # To prevent the 'client closed' error, ensure the ProxyHandler instance
+        # lives as long as the application or is created per-request.
         await self.client.aclose()
 
-    def transform_content(self, content: str) -> str:
-        if not content:
-            return content
+    async def handle_chat_completion(self, request: ChatCompletionRequest):
+        """Handle chat completion request by streaming or aggregating."""
+        is_streaming = (
+            request.stream if request.stream is not None else settings.DEFAULT_STREAM
+        )
 
-        logger.debug(f"SHOW_THINK_TAGS setting: {settings.SHOW_THINK_TAGS}")
+        # The generator that handles the core logic of communicating with the upstream
+        response_generator = self._stream_proxy_logic(request)
 
-        if not settings.SHOW_THINK_TAGS:
-            logger.debug("Removing thinking content from response")
-            original_length = len(content)
-            content = re.sub(
-                r"<details[^>]*>.*?</details>", "", content, flags=re.DOTALL
-            )
-            content = re.sub(
-                r"<details[^>]*>.*?(?=\s*[A-Z]|\s*\d|\s*$)",
-                "",
-                content,
-                flags=re.DOTALL,
-            )
-            content = content.strip()
-            logger.debug(
-                f"Content length after removing thinking content: {original_length} -> {len(content)}"
+        if is_streaming:
+            # If the client requests streaming, return the generator directly
+            return StreamingResponse(
+                response_generator,
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                },
             )
         else:
-            logger.debug("Keeping thinking content, converting to <think> tags")
-            content = re.sub(r"<details[^>]*>", "<think>", content)
-            content = content.replace("</details>", "</think>")
-            content = re.sub(r"<summary>.*?</summary>", "", content, flags=re.DOTALL)
-            if "<think>" in content and "</think>" not in content:
-                think_start = content.find("<think>")
-                if think_start != -1:
-                    answer_match = re.search(r"\n\s*[A-Z0-9]", content[think_start:])
-                    if answer_match:
-                        insert_pos = think_start + answer_match.start()
-                        content = (
-                            content[:insert_pos] + "</think>\n" + content[insert_pos:]
-                        )
-                    else:
-                        content += "</think>"
+            # If the client wants a non-streaming response, consume the generator
+            # and aggregate the content.
+            full_content = ""
+            final_id = f"chatcmpl-{time.time()}" # Fallback ID
+            async for chunk_data in response_generator:
+                if chunk_data.startswith("data: ") and not chunk_data.startswith("data: [DONE]"):
+                    try:
+                        chunk_json_str = chunk_data[6:].strip()
+                        if not chunk_json_str:
+                            continue
+                        chunk_json = json.loads(chunk_json_str)
+                        final_id = chunk_json.get("id", final_id)
+                        delta = chunk_json.get("choices", [{}])[0].get("delta", {})
+                        if delta and delta.get("content"):
+                            full_content += delta["content"]
+                    except json.JSONDecodeError:
+                        logger.warning(f"Could not decode JSON from stream chunk: {chunk_data}")
+                        continue
+            
+            import uuid
+            return ChatCompletionResponse(
+                id=final_id,
+                created=int(time.time()),
+                model=request.model,
+                choices=[
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": full_content.strip()},
+                        "finish_reason": "stop",
+                    }
+                ],
+            )
 
-        return content.strip()
-
-    async def proxy_request(self, request: ChatCompletionRequest) -> Dict[str, Any]:
+    async def _stream_proxy_logic(self, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
+        """
+        Core logic for streaming from Z.AI and transforming to OpenAI format.
+        This is a private helper method.
+        """
         cookie = await cookie_manager.get_next_cookie()
         if not cookie:
-            raise HTTPException(status_code=503, detail="No available cookies")
-
+            # In a generator, we cannot raise HTTPException directly.
+            # We yield an error message in OpenAI stream format.
+            error_chunk = {
+                "error": { "message": "No available cookies", "type": "server_error", "code": 503 }
+            }
+            yield f"data: {json.dumps(error_chunk)}\n\n"
+            return
+        
         target_model = (
             settings.UPSTREAM_MODEL
             if request.model == settings.MODEL_NAME
             else request.model
         )
-        
-        is_streaming = (
-            request.stream if request.stream is not None else settings.DEFAULT_STREAM
-        )
-
-        if is_streaming and not settings.SHOW_THINK_TAGS:
-            logger.warning("SHOW_THINK_TAGS=false is ignored for streaming responses")
 
         import uuid
         request_data = {
@@ -120,8 +142,6 @@ class ProxyHandler:
             },
         }
 
-        logger.debug(f"Sending request data: {request_data}")
-
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {cookie}",
@@ -136,167 +156,86 @@ class ProxyHandler:
             "Referer": "https://chat.z.ai/c/069723d5-060b-404f-992c-4705f1554c4c",
         }
 
-        try:
-            async with self.client.stream(
-                "POST",
-                settings.UPSTREAM_URL,
-                json=request_data,
-                headers=headers,
-                timeout=httpx.Timeout(60.0, read=300.0)
-            ) as response:
-                if response.status_code == 401:
-                    await cookie_manager.mark_cookie_failed(cookie)
-                    raise HTTPException(status_code=401, detail="Invalid authentication")
-                if response.status_code != 200:
-                    try:
-                        error_text = await response.aread()
-                        error_detail = error_text.decode('utf-8')
-                    except:
-                        error_detail = f"HTTP {response.status_code}"
-                    raise HTTPException(
-                        status_code=response.status_code,
-                        detail=f"Upstream error: {error_detail}",
-                    )
-                await cookie_manager.mark_cookie_success(cookie)
-                return {"response": response, "cookie": cookie}
-        except httpx.RequestError as e:
-            logger.error(f"Request error: {e}")
-            await cookie_manager.mark_cookie_failed(cookie)
-            raise HTTPException(
-                status_code=503, detail=f"Upstream service unavailable: {str(e)}"
-            )
-
-    async def handle_chat_completion(self, request: ChatCompletionRequest):
-        is_streaming = (
-            request.stream if request.stream is not None else settings.DEFAULT_STREAM
-        )
-
-        if is_streaming:
-            return StreamingResponse(
-                self.stream_proxy_response(request),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                },
-            )
-        else:
-            full_content = ""
-            async for chunk_data in self.stream_proxy_response(request):
-                if chunk_data.startswith("data: ") and not chunk_data.startswith("data: [DONE]"):
-                    try:
-                        chunk_json_str = chunk_data[6:]
-                        if not chunk_json_str.strip():
-                            continue
-                        chunk_json = json.loads(chunk_json_str)
-                        delta = chunk_json.get("choices", [{}])[0].get("delta", {})
-                        if delta and delta.get("content"):
-                            full_content += delta["content"]
-                    except json.JSONDecodeError:
-                        logger.warning(f"Could not decode JSON from stream chunk: {chunk_data}")
-                        continue
-            
-            import uuid
-            return ChatCompletionResponse(
-                id=f"chatcmpl-{uuid.uuid4().hex[:29]}",
-                created=int(time.time()),
-                model=request.model,
-                choices=[
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": full_content.strip()},
-                        "finish_reason": "stop",
-                    }
-                ],
-            )
-
-    async def stream_proxy_response(self, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
-        import uuid
-        
-        proxy_result = await self.proxy_request(request)
-        response = proxy_result["response"]
-        
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         in_thinking_phase = False
         buffer = ""
 
         try:
-            async for chunk in response.aiter_text():
-                buffer += chunk
-                while "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    line = line.strip()
+            async with self.client.stream(
+                "POST",
+                settings.UPSTREAM_URL,
+                json=request_data,
+                headers=headers
+            ) as response:
+                if response.status_code == 401:
+                    await cookie_manager.mark_cookie_failed(cookie)
+                    error_chunk = { "error": { "message": "Invalid authentication with upstream", "type": "auth_error", "code": 401 } }
+                    yield f"data: {json.dumps(error_chunk)}\n\n"
+                    return
+                
+                if response.status_code != 200:
+                    await cookie_manager.mark_cookie_failed(cookie)
+                    error_text = await response.aread()
+                    error_detail = error_text.decode('utf-8', errors='ignore')
+                    error_chunk = { "error": { "message": f"Upstream error ({response.status_code}): {error_detail}", "type": "server_error" } }
+                    yield f"data: {json.dumps(error_chunk)}\n\n"
+                    return
 
-                    if not line.startswith("data:"):
-                        continue
-                    
-                    payload_str = line[6:].strip()
-                    if payload_str == "[DONE]":
-                        if in_thinking_phase and settings.SHOW_THINK_TAGS:
-                            closing_think_chunk = {
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": request.model,
-                                "choices": [{"index": 0, "delta": {"content": "</think>"}, "finish_reason": None}]
-                            }
-                            yield f"data: {json.dumps(closing_think_chunk)}\n\n"
-                        break
+                await cookie_manager.mark_cookie_success(cookie)
 
-                    try:
-                        parsed = json.loads(payload_str)
-                        data = parsed.get("data", {})
-                        delta_content = data.get("delta_content", "")
-                        phase = data.get("phase", "").strip()
-                        output_content = ""
+                async for chunk in response.aiter_text():
+                    buffer += chunk
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        line = line.strip()
 
-                        # --- State Transition and Content Processing ---
+                        if not line.startswith("data:"):
+                            continue
                         
-                        # 1. Entering 'thinking' phase
-                        if phase == "thinking" and not in_thinking_phase:
-                            in_thinking_phase = True
-                            if settings.SHOW_THINK_TAGS:
-                                output_content += "<think>"
-                        
-                        # 2. Exiting 'thinking' phase
-                        elif phase != "thinking" and in_thinking_phase:
-                            in_thinking_phase = False
-                            if settings.SHOW_THINK_TAGS:
-                                output_content += "</think>"
-                        
-                        # 3. Process content based on phase
-                        if phase == "thinking":
-                            if settings.SHOW_THINK_TAGS:
-                                # Clean up Z.AI's HTML boilerplate from thinking chunks
-                                cleaned_delta = re.sub(r"<details[^>]*>|<summary>.*?</summary>", "", delta_content, flags=re.DOTALL)
+                        payload_str = line[6:].strip()
+                        if payload_str == "[DONE]":
+                            # This marks the end of Z.AI's main content stream.
+                            # Final cleanup might be needed.
+                            if in_thinking_phase and settings.SHOW_THINK_TAGS:
+                                closing_think_chunk = self._create_openai_chunk(completion_id, request.model, "</think>")
+                                yield f"data: {json.dumps(closing_think_chunk)}\n\n"
+                                in_thinking_phase = False
+                            continue
+
+                        try:
+                            parsed = json.loads(payload_str)
+                            data = parsed.get("data", {})
+                            delta_content = data.get("delta_content", "")
+                            phase = data.get("phase", "").strip()
+                            output_content = ""
+
+                            if phase == "thinking" and not in_thinking_phase:
+                                in_thinking_phase = True
+                                if settings.SHOW_THINK_TAGS:
+                                    output_content += "<think>"
+                            
+                            elif phase != "thinking" and in_thinking_phase:
+                                in_thinking_phase = False
+                                if settings.SHOW_THINK_TAGS:
+                                    output_content += "</think>"
+                            
+                            if phase == "thinking":
+                                if settings.SHOW_THINK_TAGS:
+                                    cleaned_delta = re.sub(r"<details[^>]*>|<summary>.*?</summary>", "", delta_content, flags=re.DOTALL)
+                                    output_content += cleaned_delta
+                            elif phase == "answer":
+                                cleaned_delta = delta_content.replace("</details>", "")
                                 output_content += cleaned_delta
-                        elif phase == "answer":
-                            # Clean up potential leftover tag from Z.AI's stream
-                            cleaned_delta = delta_content.replace("</details>", "")
-                            output_content += cleaned_delta
-                        
-                        if output_content:
-                            openai_chunk = {
-                                "id": completion_id,
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": request.model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"content": output_content},
-                                    "finish_reason": None
-                                }]
-                            }
-                            yield f"data: {json.dumps(openai_chunk)}\n\n"
+                            
+                            if output_content:
+                                openai_chunk = self._create_openai_chunk(completion_id, request.model, output_content)
+                                yield f"data: {json.dumps(openai_chunk)}\n\n"
 
-                    except json.JSONDecodeError:
-                        logger.debug(f"Skipping non-JSON data line: {line}")
-                        continue
-                else: # while loop exit
-                    continue
-                break # for loop exit after [DONE]
+                        except json.JSONDecodeError:
+                            logger.debug(f"Skipping non-JSON data line: {line}")
+                            continue
 
-            # Send final completion chunk
+            # After the loop finishes, send the final [DONE] message.
             final_chunk = {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
@@ -309,6 +248,20 @@ class ProxyHandler:
 
         except httpx.RequestError as e:
             logger.error(f"Streaming request error: {e}")
-            raise HTTPException(status_code=503, detail=f"Upstream service unavailable: {str(e)}")
-        finally:
-            await response.aclose()
+            await cookie_manager.mark_cookie_failed(cookie)
+            error_chunk = { "error": { "message": f"Upstream service unavailable: {str(e)}", "type": "server_error" } }
+            yield f"data: {json.dumps(error_chunk)}\n\n"
+
+    def _create_openai_chunk(self, completion_id: str, model: str, content: str) -> Dict[str, Any]:
+        """A helper to create a standard OpenAI stream chunk."""
+        return {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": None
+            }]
+        }
