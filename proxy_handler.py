@@ -65,6 +65,9 @@ class ProxyHandler:
         # Clean up any remaining HTML-like tags that might interfere
         content = re.sub(r'<[^>]+>', '', content)
         
+        # Remove any stray ">" that might appear after cleaning
+        content = re.sub(r'^>\s*', '', content.strip())
+        
         return content.strip()
 
     def transform_content(self, content: str) -> str:
@@ -300,8 +303,14 @@ class ProxyHandler:
                                     else:
                                         continue  # Skip if not showing think tags
                                 else:
-                                    # For answer phase, apply normal transformation
-                                    transformed_content = self.transform_content(delta_content)
+                                    # For answer phase, only remove <details> blocks but keep markdown
+                                    if settings.SHOW_THINK_TAGS:
+                                        # Remove <details> blocks but preserve markdown
+                                        transformed_content = re.sub(r"<details[^>]*>.*?</details>", "", delta_content, flags=re.DOTALL)
+                                    else:
+                                        # Remove <details> blocks but preserve markdown
+                                        transformed_content = re.sub(r"<details[^>]*>.*?</details>", "", delta_content, flags=re.DOTALL)
+                                    transformed_content = transformed_content.strip()
                                 
                                 if transformed_content:  # Only yield if there's content
                                     chunk = {
@@ -414,15 +423,21 @@ class ProxyHandler:
             
             if settings.SHOW_THINK_TAGS and thinking_buf:
                 # Clean thinking content and manually add think tags
-                thinking_text = self._clean_thinking_content("".join(thinking_buf))
-                answer_text = self.transform_content("".join(answer_buf)) if answer_buf else ""
+                thinking_raw = "".join(thinking_buf)
+                thinking_text = self._clean_thinking_content(thinking_raw)
+                
+                # For answer content, only remove <details> blocks but preserve markdown
+                answer_raw = "".join(answer_buf) if answer_buf else ""
+                answer_text = re.sub(r"<details[^>]*>.*?</details>", "", answer_raw, flags=re.DOTALL).strip()
                 
                 if thinking_text:  # Only add think tags if there's actual thinking content
                     final_text = f"<think>{thinking_text}</think>{answer_text}"
                 else:
                     final_text = answer_text
             else:
-                final_text = self.transform_content("".join(answer_buf))
+                # For non-thinking mode, only remove <details> blocks but preserve markdown
+                answer_raw = "".join(answer_buf)
+                final_text = re.sub(r"<details[^>]*>.*?</details>", "", answer_raw, flags=re.DOTALL).strip()
 
             return ChatCompletionResponse(
                 id=f"chatcmpl-{uuid.uuid4().hex[:29]}",
