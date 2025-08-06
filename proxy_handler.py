@@ -79,7 +79,7 @@ class ProxyHandler:
         return content
     
     async def proxy_request(self, request: ChatCompletionRequest) -> Dict[str, Any]:
-    """Proxy request to Z.AI API"""
+        """Proxy request to Z.AI API"""
     cookie = await cookie_manager.get_next_cookie()
     if not cookie:
         raise HTTPException(status_code=503, detail="No available cookies")
