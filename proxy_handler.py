@@ -169,57 +169,57 @@ class ProxyHandler:
             raise HTTPException(status_code=503, detail="Upstream service unavailable")
 
     async def process_streaming_response(self, response: httpx.Response) -> AsyncGenerator[Dict[str, Any], None]:
-    """Process streaming response from Z.AI with minimal buffering"""
-    buffer = ""
-    chunk_count = 0
-    
-    logger.info("Starting to process streaming response")
-    
-    # Use smaller chunk size for more real-time processing
-    async for chunk in response.aiter_bytes(chunk_size=1024):  # Smaller chunks
-        chunk_count += 1
-        try:
-            text_chunk = chunk.decode('utf-8')
-        except UnicodeDecodeError:
-            continue
-            
-        buffer += text_chunk
+        """Process streaming response from Z.AI with minimal buffering"""
+        buffer = ""
+        chunk_count = 0
         
-        # Process complete lines immediately
-        while '\n' in buffer:
-            line, buffer = buffer.split('\n', 1)
-            line = line.strip()
-            
-            if not line.startswith("data: "):
-                continue
-            
-            payload = line[6:].strip()
-            if payload == "[DONE]":
-                logger.info("Received [DONE] signal")
-                return
-            
+        logger.info("Starting to process streaming response")
+        
+        # Use smaller chunk size for more real-time processing
+        async for chunk in response.aiter_bytes(chunk_size=1024):  # Smaller chunks
+            chunk_count += 1
             try:
-                parsed = json.loads(payload)
-                logger.debug(f"Parsed chunk {chunk_count}: {parsed.get('data', {}).get('phase', 'no-phase')}")
+                text_chunk = chunk.decode('utf-8')
+            except UnicodeDecodeError:
+                continue
+                
+            buffer += text_chunk
+            
+            # Process complete lines immediately
+            while '\n' in buffer:
+                line, buffer = buffer.split('\n', 1)
+                line = line.strip()
+                
+                if not line.startswith("data: "):
+                    continue
+                
+                payload = line[6:].strip()
+                if payload == "[DONE]":
+                    logger.info("Received [DONE] signal")
+                    return
+                
+                try:
+                    parsed = json.loads(payload)
+                    logger.debug(f"Parsed chunk {chunk_count}: {parsed.get('data', {}).get('phase', 'no-phase')}")
 
-                # Check for errors first
-                if parsed.get("error") or (parsed.get("data", {}).get("error")):
-                    error_detail = (parsed.get("error", {}).get("detail") or
-                                  parsed.get("data", {}).get("error", {}).get("detail") or
-                                  "Unknown error from upstream")
-                    logger.error(f"Upstream error: {error_detail}")
-                    raise HTTPException(status_code=400, detail=f"Upstream error: {error_detail}")
+                    # Check for errors first
+                    if parsed.get("error") or (parsed.get("data", {}).get("error")):
+                        error_detail = (parsed.get("error", {}).get("detail") or
+                                      parsed.get("data", {}).get("error", {}).get("detail") or
+                                      "Unknown error from upstream")
+                        logger.error(f"Upstream error: {error_detail}")
+                        raise HTTPException(status_code=400, detail=f"Upstream error: {error_detail}")
 
-                # Transform the response
-                if parsed.get("data"):
-                    parsed["data"].pop("edit_index", None)
-                    parsed["data"].pop("edit_content", None)
+                    # Transform the response
+                    if parsed.get("data"):
+                        parsed["data"].pop("edit_index", None)
+                        parsed["data"].pop("edit_content", None)
 
-                yield parsed
+                    yield parsed
 
-            except json.JSONDecodeError as e:
-                logger.debug(f"JSON decode error for line: {line[:100]}...")
-                continue  # Skip non-JSON lines
+                except json.JSONDecodeError as e:
+                    logger.debug(f"JSON decode error for line: {line[:100]}...")
+                    continue  # Skip non-JSON lines
     
     async def handle_chat_completion(self, request: ChatCompletionRequest):
         """Handle chat completion request"""
