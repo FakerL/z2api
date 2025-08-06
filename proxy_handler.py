@@ -248,127 +248,127 @@ class ProxyHandler:
             return await self.non_stream_response(response, request.model)
 
     async def stream_response(self, response: httpx.Response, model: str) -> AsyncGenerator[str, None]:
-    """Generate streaming response in OpenAI format with real-time output"""
-    import uuid
-    import time
-    
-    # Generate a unique completion ID
-    completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-    
-    # Track content and phases
-    total_content = ""
-    current_phase = None
-    chunk_count = 0
-    
-    logger.info(f"Starting streaming response, SHOW_THINK_TAGS: {settings.SHOW_THINK_TAGS}")
-    
-    try:
-        async for parsed in self.process_streaming_response(response):
-            try:
-                chunk_count += 1
-                data = parsed.get("data", {})
-                delta_content = data.get("delta_content", "")
-                phase = data.get("phase", "")
-                
-                # Log chunk details for debugging
-                logger.debug(f"Chunk {chunk_count}: phase={phase}, content_length={len(delta_content)}")
-                
-                # Track phase changes
-                if phase != current_phase:
-                    current_phase = phase
-                    logger.info(f"Phase changed to: {phase}")
-                
-                # Always accumulate content for debugging
-                total_content += delta_content
-                
-                # Determine if we should send this chunk
-                should_send = False
-                transformed_delta = ""
-                
-                if delta_content:
-                    if settings.SHOW_THINK_TAGS:
-                        # Show all content, convert <details> to <think>
-                        transformed_delta = delta_content
-                        transformed_delta = re.sub(r'<details[^>]*>', '<think>', transformed_delta)
-                        transformed_delta = transformed_delta.replace('</details>', '</think>')
-                        transformed_delta = re.sub(r'<summary>.*?</summary>', '', transformed_delta, flags=re.DOTALL)
-                        should_send = True
-                        logger.debug(f"Sending chunk with think tags: {len(transformed_delta)} chars")
-                    else:
-                        # Only send answer phase content, but be more permissive
-                        if phase == "answer" or not phase:  # Include empty phase as potential answer
-                            transformed_delta = delta_content
-                            should_send = True
-                            logger.debug(f"Sending answer phase chunk: {len(transformed_delta)} chars")
-                        else:
-                            logger.debug(f"Skipping {phase} phase chunk")
-                
-                # Send chunk if we have content
-                if should_send and transformed_delta:
-                    openai_chunk = {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {
-                                "content": transformed_delta
-                            },
-                            "finish_reason": None
-                        }]
-                    }
+        """Generate streaming response in OpenAI format with real-time output"""
+        import uuid
+        import time
+        
+        # Generate a unique completion ID
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+        
+        # Track content and phases
+        total_content = ""
+        current_phase = None
+        chunk_count = 0
+        
+        logger.info(f"Starting streaming response, SHOW_THINK_TAGS: {settings.SHOW_THINK_TAGS}")
+        
+        try:
+            async for parsed in self.process_streaming_response(response):
+                try:
+                    chunk_count += 1
+                    data = parsed.get("data", {})
+                    delta_content = data.get("delta_content", "")
+                    phase = data.get("phase", "")
                     
-                    chunk_data = f"data: {json.dumps(openai_chunk)}\n\n"
-                    logger.debug(f"Yielding chunk: {len(chunk_data)} bytes")
-                    yield chunk_data
-                
-                # Force a small heartbeat chunk occasionally to keep connection alive
-                elif chunk_count % 10 == 0:  # Every 10 chunks, send a heartbeat
-                    heartbeat_chunk = {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": None
-                        }]
-                    }
-                    yield f"data: {json.dumps(heartbeat_chunk)}\n\n"
-                
-            except Exception as e:
-                logger.error(f"Error processing streaming chunk {chunk_count}: {e}")
-                continue
-        
-        logger.info(f"Streaming completed. Total chunks: {chunk_count}, Total content: {len(total_content)} chars")
-        
-        # Send final completion chunk
-        final_chunk = {
-            "id": completion_id,
-            "object": "chat.completion.chunk", 
-            "created": int(time.time()),
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {},
-                "finish_reason": "stop"
-            }]
-        }
-        
-        yield f"data: {json.dumps(final_chunk)}\n\n"
-        yield "data: [DONE]\n\n"
-        
-    except Exception as e:
-        logger.error(f"Streaming error: {e}")
-        error_chunk = {
-            "error": {
-                "message": str(e),
-                "type": "server_error"
+                    # Log chunk details for debugging
+                    logger.debug(f"Chunk {chunk_count}: phase={phase}, content_length={len(delta_content)}")
+                    
+                    # Track phase changes
+                    if phase != current_phase:
+                        current_phase = phase
+                        logger.info(f"Phase changed to: {phase}")
+                    
+                    # Always accumulate content for debugging
+                    total_content += delta_content
+                    
+                    # Determine if we should send this chunk
+                    should_send = False
+                    transformed_delta = ""
+                    
+                    if delta_content:
+                        if settings.SHOW_THINK_TAGS:
+                            # Show all content, convert <details> to <think>
+                            transformed_delta = delta_content
+                            transformed_delta = re.sub(r'<details[^>]*>', '<think>', transformed_delta)
+                            transformed_delta = transformed_delta.replace('</details>', '</think>')
+                            transformed_delta = re.sub(r'<summary>.*?</summary>', '', transformed_delta, flags=re.DOTALL)
+                            should_send = True
+                            logger.debug(f"Sending chunk with think tags: {len(transformed_delta)} chars")
+                        else:
+                            # Only send answer phase content, but be more permissive
+                            if phase == "answer" or not phase:  # Include empty phase as potential answer
+                                transformed_delta = delta_content
+                                should_send = True
+                                logger.debug(f"Sending answer phase chunk: {len(transformed_delta)} chars")
+                            else:
+                                logger.debug(f"Skipping {phase} phase chunk")
+                    
+                    # Send chunk if we have content
+                    if should_send and transformed_delta:
+                        openai_chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {
+                                    "content": transformed_delta
+                                },
+                                "finish_reason": None
+                            }]
+                        }
+                        
+                        chunk_data = f"data: {json.dumps(openai_chunk)}\n\n"
+                        logger.debug(f"Yielding chunk: {len(chunk_data)} bytes")
+                        yield chunk_data
+                    
+                    # Force a small heartbeat chunk occasionally to keep connection alive
+                    elif chunk_count % 10 == 0:  # Every 10 chunks, send a heartbeat
+                        heartbeat_chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": None
+                            }]
+                        }
+                        yield f"data: {json.dumps(heartbeat_chunk)}\n\n"
+                    
+                except Exception as e:
+                    logger.error(f"Error processing streaming chunk {chunk_count}: {e}")
+                    continue
+            
+            logger.info(f"Streaming completed. Total chunks: {chunk_count}, Total content: {len(total_content)} chars")
+            
+            # Send final completion chunk
+            final_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk", 
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
             }
-        }
-        yield f"data: {json.dumps(error_chunk)}\n\n"
+            
+            yield f"data: {json.dumps(final_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+            
+        except Exception as e:
+            logger.error(f"Streaming error: {e}")
+            error_chunk = {
+                "error": {
+                    "message": str(e),
+                    "type": "server_error"
+                }
+            }
+            yield f"data: {json.dumps(error_chunk)}\n\n"
     
     async def non_stream_response(self, response: httpx.Response, model: str) -> ChatCompletionResponse:
         """Generate non-streaming response"""
