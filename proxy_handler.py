@@ -1,6 +1,5 @@
 """
 Proxy handler for Z.AI API requests
-Updated: 2025-08-06
 """
 
 import json
@@ -57,17 +56,16 @@ class ProxyHandler:
         if not content:
             return content
             
-        # Remove <details> and related tags
-        content = re.sub(r'<details[^>]*>', '', content)
-        content = re.sub(r'</details>', '', content)
-        content = re.sub(r'<summary[^>]*>.*?</summary>', '', content, flags=re.DOTALL)
+        # Remove <details> and related tags more carefully
+        content = re.sub(r'<details[^>]*>', '', content, flags=re.IGNORECASE)
+        content = re.sub(r'</details>', '', content, flags=re.IGNORECASE)
+        content = re.sub(r'<summary[^>]*>.*?</summary>', '', content, flags=re.DOTALL | re.IGNORECASE)
         
         # Clean up any remaining HTML-like tags that might interfere
         content = re.sub(r'<[^>]+>', '', content)
         
-        # Remove any stray ">" that might appear after cleaning, but be more careful
-        content = re.sub(r'^>\s*', '', content)
-        content = re.sub(r'\n>\s*', '\n', content)
+        # More careful removal of stray ">" - only at line start with optional whitespace
+        content = re.sub(r'^\s*>\s*', '', content, flags=re.MULTILINE)
         
         return content.strip()
 
@@ -77,7 +75,7 @@ class ProxyHandler:
             return content
             
         # Only remove <details> blocks, preserve all markdown and other content
-        content = re.sub(r"<details[^>]*>.*?</details>", "", content, flags=re.DOTALL)
+        content = re.sub(r"<details[^>]*>.*?</details>", "", content, flags=re.DOTALL | re.IGNORECASE)
         
         return content
 
@@ -88,14 +86,14 @@ class ProxyHandler:
             
         if settings.SHOW_THINK_TAGS:
             # Replace <details> with <think>
-            content = re.sub(r"<details[^>]*>", "<think>", content)
-            content = re.sub(r"</details>", "</think>", content)
+            content = re.sub(r"<details[^>]*>", "<think>", content, flags=re.IGNORECASE)
+            content = re.sub(r"</details>", "</think>", content, flags=re.IGNORECASE)
             # Remove <summary> tags
-            content = re.sub(r"<summary>.*?</summary>", "", content, flags=re.DOTALL)
+            content = re.sub(r"<summary>.*?</summary>", "", content, flags=re.DOTALL | re.IGNORECASE)
             content = self._balance_think_tag(content)
         else:
             # Remove entire <details> blocks
-            content = re.sub(r"<details[^>]*>.*?</details>", "", content, flags=re.DOTALL)
+            content = re.sub(r"<details[^>]*>.*?</details>", "", content, flags=re.DOTALL | re.IGNORECASE)
 
         return content.strip()
 
@@ -175,6 +173,22 @@ class ProxyHandler:
         }
         return req_body, headers, cookie
 
+    def _is_complete_event(self, text: str) -> bool:
+        """Check if the text contains complete SSE events"""
+        return '\n\n' in text or text.strip().endswith('\n')
+
+    def _extract_complete_events(self, buffer: str) -> tuple[list[str], str]:
+        """Extract complete events from buffer and return remaining incomplete data"""
+        events = []
+        remaining = buffer
+        
+        while '\n\n' in remaining:
+            event, remaining = remaining.split('\n\n', 1)
+            if event.strip():
+                events.append(event.strip())
+        
+        return events, remaining
+
     # Main streaming logic
     async def stream_proxy_response(self, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
         """Handle streaming proxy response"""
@@ -191,6 +205,7 @@ class ProxyHandler:
             completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
             think_open = False  # Track if <think> tag is open
             current_phase = None
+            buffer = ""  # Buffer for incomplete UTF-8 sequences and events
 
             async with client.stream("POST", settings.UPSTREAM_URL, json=req_body, headers=headers) as response:
                 if response.status_code != 200:
@@ -211,125 +226,140 @@ class ProxyHandler:
                     return
 
                 async for raw_chunk in response.aiter_text():
-                    if not raw_chunk or raw_chunk.isspace():
+                    if not raw_chunk:
                         continue
 
-                    # Handle Server-Sent Events format
-                    lines = raw_chunk.split('\n')
-                    for line in lines:
-                        line = line.strip()
-                        if not line or line.startswith(':'):
+                    # Add to buffer to handle incomplete events and UTF-8 sequences
+                    buffer += raw_chunk
+
+                    # Extract complete events from buffer
+                    complete_events, buffer = self._extract_complete_events(buffer)
+
+                    for event_text in complete_events:
+                        if not event_text or event_text.isspace():
                             continue
 
-                        if line.startswith('data: '):
-                            payload = line[6:]
-                            
-                            if payload == '[DONE]':
-                                # Close thinking tag if still open
-                                if think_open and settings.SHOW_THINK_TAGS:
-                                    close_chunk = {
-                                        "id": completion_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": int(time.time()),
-                                        "model": request.model,
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": {"content": "</think>"},
-                                            "finish_reason": None
-                                        }]
-                                    }
-                                    yield f"data: {json.dumps(close_chunk)}\n\n"
-
-                                final_chunk = {
-                                    "id": completion_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": int(time.time()),
-                                    "model": request.model,
-                                    "choices": [{
-                                        "index": 0,
-                                        "delta": {},
-                                        "finish_reason": "stop"
-                                    }]
-                                }
-                                yield f"data: {json.dumps(final_chunk)}\n\n"
-                                yield "data: [DONE]\n\n"
-                                return
-
-                            # Handle normal JSON
-                            try:
-                                parsed = json.loads(payload)
-                            except json.JSONDecodeError:
+                        # Handle Server-Sent Events format
+                        lines = event_text.split('\n')
+                        for line in lines:
+                            line = line.strip()
+                            if not line or line.startswith(':'):
                                 continue
 
-                            data = parsed.get("data", {})
-                            delta_content = data.get("delta_content", "")
-                            phase = data.get("phase")
-
-                            # Handle phase changes
-                            if phase != current_phase:
-                                current_phase = phase
-                                if phase == "answer" and think_open and settings.SHOW_THINK_TAGS:
-                                    # Auto-close thinking phase
-                                    auto_close = {
-                                        "id": completion_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": int(time.time()),
-                                        "model": request.model,
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": {"content": "</think>"},
-                                            "finish_reason": None
-                                        }]
-                                    }
-                                    yield f"data: {json.dumps(auto_close)}\n\n"
-                                    think_open = False
-
-                            # Decide whether to output content
-                            if phase == "thinking" and not settings.SHOW_THINK_TAGS:
-                                continue  # Skip thinking content
-
-                            if delta_content:
-                                if phase == "thinking" and settings.SHOW_THINK_TAGS:
-                                    # First time entering thinking phase, add <think> tag
-                                    if not think_open:
-                                        think_chunk = {
+                            if line.startswith('data: '):
+                                payload = line[6:]
+                                
+                                if payload == '[DONE]':
+                                    # Close thinking tag if still open
+                                    if think_open and settings.SHOW_THINK_TAGS:
+                                        close_chunk = {
                                             "id": completion_id,
                                             "object": "chat.completion.chunk",
                                             "created": int(time.time()),
                                             "model": request.model,
                                             "choices": [{
                                                 "index": 0,
-                                                "delta": {"content": "<think>"},
+                                                "delta": {"content": "</think>"},
                                                 "finish_reason": None
                                             }]
                                         }
-                                        yield f"data: {json.dumps(think_chunk)}\n\n"
-                                        think_open = True
+                                        yield f"data: {json.dumps(close_chunk)}\n\n"
 
-                                # Transform content based on phase
-                                if phase == "thinking":
-                                    if settings.SHOW_THINK_TAGS:
-                                        # Clean thinking content but don't add <think> tags (already added above)
-                                        transformed_content = self._clean_thinking_content(delta_content)
-                                    else:
-                                        continue  # Skip if not showing think tags
-                                else:
-                                    # For answer phase, use minimal cleaning to preserve markdown
-                                    transformed_content = self._clean_answer_content(delta_content)
-                                
-                                if transformed_content:  # Only yield if there's content
-                                    chunk = {
+                                    final_chunk = {
                                         "id": completion_id,
                                         "object": "chat.completion.chunk",
                                         "created": int(time.time()),
                                         "model": request.model,
                                         "choices": [{
                                             "index": 0,
-                                            "delta": {"content": transformed_content},
-                                            "finish_reason": None
+                                            "delta": {},
+                                            "finish_reason": "stop"
                                         }]
                                     }
-                                    yield f"data: {json.dumps(chunk)}\n\n"
+                                    yield f"data: {json.dumps(final_chunk)}\n\n"
+                                    yield "data: [DONE]\n\n"
+                                    return
+
+                                # Handle normal JSON
+                                try:
+                                    parsed = json.loads(payload)
+                                except json.JSONDecodeError:
+                                    continue
+
+                                data = parsed.get("data", {})
+                                delta_content = data.get("delta_content", "")
+                                phase = data.get("phase")
+
+                                # Handle phase changes
+                                if phase != current_phase:
+                                    current_phase = phase
+                                    if phase == "answer" and think_open and settings.SHOW_THINK_TAGS:
+                                        # Auto-close thinking phase
+                                        auto_close = {
+                                            "id": completion_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": int(time.time()),
+                                            "model": request.model,
+                                            "choices": [{
+                                                "index": 0,
+                                                "delta": {"content": "</think>"},
+                                                "finish_reason": None
+                                            }]
+                                        }
+                                        yield f"data: {json.dumps(auto_close)}\n\n"
+                                        think_open = False
+
+                                # Decide whether to output content
+                                if phase == "thinking" and not settings.SHOW_THINK_TAGS:
+                                    continue  # Skip thinking content
+
+                                if delta_content:
+                                    if phase == "thinking" and settings.SHOW_THINK_TAGS:
+                                        # First time entering thinking phase, add <think> tag
+                                        if not think_open:
+                                            think_chunk = {
+                                                "id": completion_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": request.model,
+                                                "choices": [{
+                                                    "index": 0,
+                                                    "delta": {"content": "<think>"},
+                                                    "finish_reason": None
+                                                }]
+                                            }
+                                            yield f"data: {json.dumps(think_chunk)}\n\n"
+                                            think_open = True
+
+                                    # Transform content based on phase with minimal processing
+                                    if phase == "thinking":
+                                        if settings.SHOW_THINK_TAGS:
+                                            # Minimal cleaning for thinking content
+                                            transformed_content = self._clean_thinking_content(delta_content)
+                                        else:
+                                            continue  # Skip if not showing think tags
+                                    else:
+                                        # For answer phase, minimal cleaning to preserve all content
+                                        transformed_content = self._clean_answer_content(delta_content)
+                                    
+                                    # Only yield if there's actual content after transformation
+                                    if transformed_content:
+                                        chunk = {
+                                            "id": completion_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": int(time.time()),
+                                            "model": request.model,
+                                            "choices": [{
+                                                "index": 0,
+                                                "delta": {"content": transformed_content},
+                                                "finish_reason": None
+                                            }]
+                                        }
+                                        yield f"data: {json.dumps(chunk)}\n\n"
+
+                # Handle any remaining incomplete events in buffer at the end
+                if buffer.strip():
+                    logger.warning(f"Incomplete event in buffer at end: {buffer[:100]}...")
 
         except httpx.RequestError as e:
             logger.error(f"Request error: {e}")
@@ -380,6 +410,7 @@ class ProxyHandler:
             thinking_buf = []
             answer_buf = []
             current_phase = None
+            buffer = ""  # Buffer for handling incomplete events
 
             async with client.stream("POST", settings.UPSTREAM_URL, json=req_body, headers=headers) as response:
                 if response.status_code != 200:
@@ -387,39 +418,49 @@ class ProxyHandler:
                     raise HTTPException(status_code=response.status_code, detail="Upstream API error")
 
                 async for raw_chunk in response.aiter_text():
-                    if not raw_chunk or raw_chunk.isspace():
+                    if not raw_chunk:
                         continue
 
-                    lines = raw_chunk.split('\n')
-                    for line in lines:
-                        line = line.strip()
-                        if not line or line.startswith(':'):
-                            continue
-                        
-                        if not line.startswith('data: '):
-                            continue
+                    # Add to buffer to handle incomplete events
+                    buffer += raw_chunk
 
-                        payload = line[6:]
-                        if payload == '[DONE]':
-                            break
+                    # Extract complete events
+                    complete_events, buffer = self._extract_complete_events(buffer)
 
-                        try:
-                            parsed = json.loads(payload)
-                        except json.JSONDecodeError:
+                    for event_text in complete_events:
+                        if not event_text or event_text.isspace():
                             continue
 
-                        data = parsed.get("data", {})
-                        delta_content = data.get("delta_content", "")
-                        phase = data.get("phase")
+                        lines = event_text.split('\n')
+                        for line in lines:
+                            line = line.strip()
+                            if not line or line.startswith(':'):
+                                continue
+                            
+                            if not line.startswith('data: '):
+                                continue
 
-                        if phase != current_phase:
-                            current_phase = phase
+                            payload = line[6:]
+                            if payload == '[DONE]':
+                                break
 
-                        if delta_content:
-                            if phase == "thinking":
-                                thinking_buf.append(delta_content)
-                            elif phase == "answer":
-                                answer_buf.append(delta_content)
+                            try:
+                                parsed = json.loads(payload)
+                            except json.JSONDecodeError:
+                                continue
+
+                            data = parsed.get("data", {})
+                            delta_content = data.get("delta_content", "")
+                            phase = data.get("phase")
+
+                            if phase != current_phase:
+                                current_phase = phase
+
+                            if delta_content:
+                                if phase == "thinking":
+                                    thinking_buf.append(delta_content)
+                                elif phase == "answer":
+                                    answer_buf.append(delta_content)
 
             # Combine thinking and answer content
             final_text = ""
