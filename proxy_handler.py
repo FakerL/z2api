@@ -6,9 +6,8 @@ import json
 import logging
 import re
 import time
-from typing import AsyncGenerator, Dict, Any, Optional
+from typing import AsyncGenerator, Dict, Any
 import httpx
-from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
 from config import settings
@@ -82,7 +81,6 @@ class ProxyHandler:
     async def _stream_proxy_logic(self, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
         """
         Core logic for streaming from Z.AI and transforming to OpenAI format.
-        This version uses a stateless, pattern-based approach which is more robust.
         """
         cookie = await cookie_manager.get_next_cookie()
         if not cookie:
@@ -92,13 +90,26 @@ class ProxyHandler:
         
         target_model = settings.UPSTREAM_MODEL
         import uuid
+        
+        # KEY FIX: Add "enable_thinking": True to the features object to force the thinking phase.
         request_data = {
-            "stream": True, "model": target_model, "messages": request.model_dump(exclude_none=True)["messages"],
-            "background_tasks": {"title_generation": True, "tags_generation": True}, "chat_id": str(uuid.uuid4()),
-            "features": {"image_generation": False, "code_interpreter": False, "web_search": False, "auto_web_search": False},
-            "id": str(uuid.uuid4()), "mcp_servers": ["deep-web-search"],
-            "model_item": {"id": target_model, "name": "GLM-4.5", "owned_by": "openai"}, "params": {}, "tool_servers": [],
-            "variables": {"{{USER_NAME}}": "User", "{{USER_LOCATION}}": "Unknown", "{{CURRENT_DATETIME}}": "2025-08-04 16:46:56"},
+            "stream": True,
+            "model": target_model,
+            "messages": request.model_dump(exclude_none=True)["messages"],
+            "features": {
+                "image_generation": False,
+                "code_interpreter": False,
+                "web_search": False,
+                "auto_web_search": False,
+                "enable_thinking": True,  # This is the critical flag.
+            },
+            "id": str(uuid.uuid4()),
+            "model_item": {"id": target_model, "name": "GLM-4.5", "owned_by": "openai"},
+            "variables": {
+                "{{USER_NAME}}": "User",
+                "{{USER_LOCATION}}": "Unknown",
+                "{{CURRENT_DATETIME}}": time.strftime("%Y-%m-%d %H:%M:%S"),
+            },
         }
 
         headers = {
@@ -107,7 +118,7 @@ class ProxyHandler:
             "Accept": "application/json, text/event-stream", "Accept-Language": "zh-CN",
             "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"', "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"', "x-fe-version": "prod-fe-1.0.53", "Origin": "https://chat.z.ai",
-            "Referer": "https://chat.z.ai/c/069723d5-060b-404f-992c-4705f1554c4c",
+            "Referer": "https://chat.z.ai/",
         }
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
@@ -119,7 +130,6 @@ class ProxyHandler:
             try:
                 async with client.stream("POST", settings.UPSTREAM_URL, json=request_data, headers=headers) as response:
                     if response.status_code != 200:
-                        # Handle auth or other server errors
                         await cookie_manager.mark_cookie_failed(cookie)
                         error_text = await response.aread()
                         error_detail = error_text.decode('utf-8', errors='ignore')
@@ -150,21 +160,18 @@ class ProxyHandler:
                                 delta_content = data.get("delta_content", "")
                                 phase = data.get("phase", "").strip()
 
-                                output_content = ""
+                                if not delta_content:
+                                    continue
 
+                                output_content = ""
                                 if settings.SHOW_THINK_TAGS:
-                                    # Simple, stateless pattern replacement
                                     temp_content = re.sub(r'<details[^>]*>\s*<summary>.*?</summary>', '<think>', delta_content, flags=re.DOTALL)
                                     output_content = temp_content.replace('</details>', '</think>')
                                 else:
-                                    # Filter mode
                                     if phase == "thinking":
-                                        output_content = ""  # Discard all thinking chunks
+                                        output_content = ""
                                     elif phase == "answer":
-                                        # For answer chunks, especially the transition one,
-                                        # remove any thinking content that came with it.
                                         if '</details>' in delta_content:
-                                            # Take only the part after the closing tag
                                             output_content = delta_content.split('</details>', 1)[1]
                                         else:
                                             output_content = delta_content
