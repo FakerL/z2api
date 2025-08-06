@@ -167,7 +167,7 @@ class ProxyHandler:
             logger.error(f"Request error: {e}")
             await cookie_manager.mark_cookie_failed(cookie)
             raise HTTPException(status_code=503, detail="Upstream service unavailable")
-    
+
     async def process_streaming_response(self, response: httpx.Response) -> AsyncGenerator[Dict[str, Any], None]:
     """Process streaming response from Z.AI with minimal buffering"""
     buffer = ""
