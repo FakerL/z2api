@@ -1,5 +1,6 @@
 """
 Proxy handler for Z.AI API requests
+Updated: 2025-08-06
 """
 
 import json
@@ -51,33 +52,65 @@ class ProxyHandler:
                 text = re.sub(r"</think>(?!</think>)(?![^<]*</think>)$", "", text, count=1)
         return text
 
-    def _clean_thinking_content(self, content: str) -> str:
-        """Clean thinking content by removing HTML tags but preserving the actual thinking text"""
+    def _safe_clean_content(self, content: str, is_thinking: bool = False) -> str:
+        """Safely clean content without accidentally removing first characters"""
         if not content:
             return content
+        
+        original_content = content
+        
+        try:
+            # Step 1: Remove HTML details blocks carefully
+            # Use non-greedy matching and be very specific
+            content = re.sub(r'<details\b[^>]*>.*?</details>', '', content, flags=re.DOTALL | re.IGNORECASE)
             
-        # Remove <details> and related tags more carefully
-        content = re.sub(r'<details[^>]*>', '', content, flags=re.IGNORECASE)
-        content = re.sub(r'</details>', '', content, flags=re.IGNORECASE)
-        content = re.sub(r'<summary[^>]*>.*?</summary>', '', content, flags=re.DOTALL | re.IGNORECASE)
-        
-        # Clean up any remaining HTML-like tags that might interfere
-        content = re.sub(r'<[^>]+>', '', content)
-        
-        # More careful removal of stray ">" - only at line start with optional whitespace
-        content = re.sub(r'^\s*>\s*', '', content, flags=re.MULTILINE)
-        
-        return content.strip()
-
-    def _clean_answer_content(self, content: str) -> str:
-        """Clean answer content by only removing <details> blocks but preserving everything else"""
-        if not content:
-            return content
+            # Step 2: Remove summary tags
+            content = re.sub(r'<summary\b[^>]*>.*?</summary>', '', content, flags=re.DOTALL | re.IGNORECASE)
             
-        # Only remove <details> blocks, preserve all markdown and other content
-        content = re.sub(r"<details[^>]*>.*?</details>", "", content, flags=re.DOTALL | re.IGNORECASE)
+            # Step 3: Remove other HTML tags but be very careful
+            content = re.sub(r'<(?!think|/think)[^>]*>', '', content, flags=re.IGNORECASE)
+            
+            # Step 4: Handle line-start > symbols only if they're clearly quote markers
+            # Only remove if there's whitespace after the > or if it's at the very start of a line
+            if is_thinking:
+                # Be extra careful with thinking content
+                lines = content.split('\n')
+                cleaned_lines = []
+                for line in lines:
+                    # Only remove > if it's clearly a quote marker (followed by space or at line start with no other content)
+                    if re.match(r'^\s*>\s*$', line):
+                        # Empty quote line, skip it
+                        continue
+                    elif re.match(r'^\s*>\s+', line):
+                        # Quote with content, remove the > and leading space
+                        cleaned_lines.append(re.sub(r'^\s*>\s*', '', line))
+                    else:
+                        # Keep the line as is
+                        cleaned_lines.append(line)
+                content = '\n'.join(cleaned_lines)
+            
+            # Step 5: Clean up excessive whitespace
+            content = re.sub(r'\n\s*\n\s*\n', '\n\n', content)  # Reduce multiple empty lines
+            content = content.strip()
+            
+            # Safety check: if we accidentally removed too much content, use original
+            if len(content) < len(original_content) * 0.5 and original_content.strip():
+                logger.warning(f"Content cleaning removed too much content, using original. Original: {original_content[:100]}...")
+                return original_content.strip()
+                
+        except Exception as e:
+            logger.error(f"Error in content cleaning: {e}, using original content")
+            return original_content.strip()
         
         return content
+
+    def _clean_thinking_content(self, content: str) -> str:
+        """Clean thinking content safely"""
+        return self._safe_clean_content(content, is_thinking=True)
+
+    def _clean_answer_content(self, content: str) -> str:
+        """Clean answer content safely"""
+        return self._safe_clean_content(content, is_thinking=False)
 
     def transform_content(self, content: str) -> str:
         """Transform upstream HTML to <think> format"""
@@ -173,21 +206,52 @@ class ProxyHandler:
         }
         return req_body, headers, cookie
 
-    def _is_complete_event(self, text: str) -> bool:
-        """Check if the text contains complete SSE events"""
-        return '\n\n' in text or text.strip().endswith('\n')
-
     def _extract_complete_events(self, buffer: str) -> tuple[list[str], str]:
         """Extract complete events from buffer and return remaining incomplete data"""
         events = []
         remaining = buffer
         
+        # Handle multiple complete events
         while '\n\n' in remaining:
             event, remaining = remaining.split('\n\n', 1)
             if event.strip():
                 events.append(event.strip())
         
         return events, remaining
+
+    def _process_delta_content(self, delta_content: str, phase: str, is_first_content: bool = False) -> str:
+        """Process delta content with extra safety for first content"""
+        if not delta_content:
+            return ""
+        
+        # For debugging - log the raw content
+        if is_first_content:
+            logger.debug(f"First content in {phase} phase - Raw: {repr(delta_content[:50])}")
+        
+        # Apply minimal processing to preserve content integrity
+        if phase == "thinking":
+            if settings.SHOW_THINK_TAGS:
+                # Very minimal cleaning for thinking content
+                processed = self._clean_thinking_content(delta_content)
+            else:
+                return ""  # Skip thinking content if not showing tags
+        else:
+            # For answer phase, apply minimal cleaning
+            processed = self._clean_answer_content(delta_content)
+        
+        # Safety check for first content
+        if is_first_content and processed and delta_content:
+            # Check if we accidentally removed the first character
+            original_first_char = delta_content.lstrip()[0] if delta_content.lstrip() else ""
+            processed_first_char = processed.lstrip()[0] if processed.lstrip() else ""
+            
+            if original_first_char and processed_first_char != original_first_char:
+                logger.warning(f"First character mismatch in {phase} phase. Original: {repr(original_first_char)}, Processed: {repr(processed_first_char)}")
+                # Use original content if first character was lost
+                if phase == "answer":
+                    processed = delta_content  # For answer phase, prefer original
+        
+        return processed
 
     # Main streaming logic
     async def stream_proxy_response(self, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
@@ -206,6 +270,7 @@ class ProxyHandler:
             think_open = False  # Track if <think> tag is open
             current_phase = None
             buffer = ""  # Buffer for incomplete UTF-8 sequences and events
+            phase_content_count = {"thinking": 0, "answer": 0}  # Track content count per phase
 
             async with client.stream("POST", settings.UPSTREAM_URL, json=req_body, headers=headers) as response:
                 if response.status_code != 200:
@@ -292,6 +357,10 @@ class ProxyHandler:
 
                                 # Handle phase changes
                                 if phase != current_phase:
+                                    # Reset content count for new phase
+                                    if phase:
+                                        phase_content_count[phase] = 0
+                                    
                                     current_phase = phase
                                     if phase == "answer" and think_open and settings.SHOW_THINK_TAGS:
                                         # Auto-close thinking phase
@@ -331,19 +400,18 @@ class ProxyHandler:
                                             yield f"data: {json.dumps(think_chunk)}\n\n"
                                             think_open = True
 
-                                    # Transform content based on phase with minimal processing
-                                    if phase == "thinking":
-                                        if settings.SHOW_THINK_TAGS:
-                                            # Minimal cleaning for thinking content
-                                            transformed_content = self._clean_thinking_content(delta_content)
-                                        else:
-                                            continue  # Skip if not showing think tags
-                                    else:
-                                        # For answer phase, minimal cleaning to preserve all content
-                                        transformed_content = self._clean_answer_content(delta_content)
+                                    # Check if this is the first content in this phase
+                                    is_first_content = phase_content_count.get(phase, 0) == 0
+                                    
+                                    # Process content with extra care for first content
+                                    transformed_content = self._process_delta_content(
+                                        delta_content, phase, is_first_content
+                                    )
                                     
                                     # Only yield if there's actual content after transformation
                                     if transformed_content:
+                                        phase_content_count[phase] += 1
+                                        
                                         chunk = {
                                             "id": completion_id,
                                             "object": "chat.completion.chunk",
@@ -462,26 +530,27 @@ class ProxyHandler:
                                 elif phase == "answer":
                                     answer_buf.append(delta_content)
 
-            # Combine thinking and answer content
+            # Combine thinking and answer content with safer processing
             final_text = ""
             
             if settings.SHOW_THINK_TAGS and thinking_buf:
-                # Clean thinking content
+                # Process thinking content
                 thinking_raw = "".join(thinking_buf)
-                thinking_text = self._clean_thinking_content(thinking_raw)
+                # Use safer content processing
+                thinking_text = self._process_delta_content(thinking_raw, "thinking", True)
                 
-                # Clean answer content minimally
+                # Process answer content
                 answer_raw = "".join(answer_buf) if answer_buf else ""
-                answer_text = self._clean_answer_content(answer_raw)
+                answer_text = self._process_delta_content(answer_raw, "answer", True) if answer_raw else ""
                 
                 if thinking_text:
                     final_text = f"<think>{thinking_text}</think>{answer_text}"
                 else:
                     final_text = answer_text
             else:
-                # Clean answer content minimally
+                # Process answer content only
                 answer_raw = "".join(answer_buf)
-                final_text = self._clean_answer_content(answer_raw)
+                final_text = self._process_delta_content(answer_raw, "answer", True) if answer_raw else ""
 
             return ChatCompletionResponse(
                 id=f"chatcmpl-{uuid.uuid4().hex[:29]}",
