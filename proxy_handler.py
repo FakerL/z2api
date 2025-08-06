@@ -97,9 +97,7 @@ class ProxyHandler:
         """
         cookie = await cookie_manager.get_next_cookie()
         if not cookie:
-            error_chunk = {
-                "error": { "message": "No available cookies", "type": "server_error", "code": 503 }
-            }
+            error_chunk = { "error": { "message": "No available cookies", "type": "server_error", "code": 503 } }
             yield f"data: {json.dumps(error_chunk)}\n\n"
             return
         
@@ -111,40 +109,20 @@ class ProxyHandler:
 
         import uuid
         request_data = {
-            "stream": True,
-            "model": target_model,
-            "messages": request.model_dump(exclude_none=True)["messages"],
-            "background_tasks": {"title_generation": True, "tags_generation": True},
-            "chat_id": str(uuid.uuid4()),
-            "features": {
-                "image_generation": False,
-                "code_interpreter": False,
-                "web_search": False,
-                "auto_web_search": False,
-            },
-            "id": str(uuid.uuid4()),
-            "mcp_servers": ["deep-web-search"],
-            "model_item": {"id": target_model, "name": "GLM-4.5", "owned_by": "openai"},
-            "params": {},
-            "tool_servers": [],
-            "variables": {
-                "{{USER_NAME}}": "User",
-                "{{USER_LOCATION}}": "Unknown",
-                "{{CURRENT_DATETIME}}": "2025-08-04 16:46:56",
-            },
+            "stream": True, "model": target_model, "messages": request.model_dump(exclude_none=True)["messages"],
+            "background_tasks": {"title_generation": True, "tags_generation": True}, "chat_id": str(uuid.uuid4()),
+            "features": { "image_generation": False, "code_interpreter": False, "web_search": False, "auto_web_search": False, },
+            "id": str(uuid.uuid4()), "mcp_servers": ["deep-web-search"],
+            "model_item": {"id": target_model, "name": "GLM-4.5", "owned_by": "openai"}, "params": {}, "tool_servers": [],
+            "variables": { "{{USER_NAME}}": "User", "{{USER_LOCATION}}": "Unknown", "{{CURRENT_DATETIME}}": "2025-08-04 16:46:56", },
         }
 
         headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {cookie}",
+            "Content-Type": "application/json", "Authorization": f"Bearer {cookie}",
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/event-stream",
-            "Accept-Language": "zh-CN",
-            "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"macOS"',
-            "x-fe-version": "prod-fe-1.0.53",
-            "Origin": "https://chat.z.ai",
+            "Accept": "application/json, text/event-stream", "Accept-Language": "zh-CN",
+            "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"', "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"macOS"', "x-fe-version": "prod-fe-1.0.53", "Origin": "https://chat.z.ai",
             "Referer": "https://chat.z.ai/c/069723d5-060b-404f-992c-4705f1554c4c",
         }
 
@@ -159,10 +137,7 @@ class ProxyHandler:
         ) as client:
             try:
                 async with client.stream(
-                    "POST",
-                    settings.UPSTREAM_URL,
-                    json=request_data,
-                    headers=headers
+                    "POST", settings.UPSTREAM_URL, json=request_data, headers=headers
                 ) as response:
                     if response.status_code == 401:
                         await cookie_manager.mark_cookie_failed(cookie)
@@ -192,8 +167,7 @@ class ProxyHandler:
                             payload_str = line[6:].strip()
                             if payload_str == "[DONE]":
                                 if in_thinking_phase and settings.SHOW_THINK_TAGS:
-                                    closing_think_chunk = self._create_openai_chunk(completion_id, request.model, "</think>")
-                                    yield f"data: {json.dumps(closing_think_chunk)}\n\n"
+                                    yield f"data: {json.dumps(self._create_openai_chunk(completion_id, request.model, '</think>'))}\n\n"
                                     in_thinking_phase = False
                                 continue
 
@@ -202,40 +176,35 @@ class ProxyHandler:
                                 data = parsed.get("data", {})
                                 delta_content = data.get("delta_content", "")
                                 phase = data.get("phase", "").strip()
-                                output_content = ""
 
-                                if phase == "thinking" and not in_thinking_phase:
-                                    in_thinking_phase = True
-                                    if settings.SHOW_THINK_TAGS:
-                                        output_content += "<think>"
-                                
-                                elif phase != "thinking" and in_thinking_phase:
-                                    in_thinking_phase = False
-                                    if settings.SHOW_THINK_TAGS:
-                                        output_content += "</think>"
-                                
+                                # --- KEY LOGIC REWRITE ---
+                                # First, handle state transitions and emit tags separately.
+                                if settings.SHOW_THINK_TAGS:
+                                    if phase == "thinking" and not in_thinking_phase:
+                                        in_thinking_phase = True
+                                        yield f"data: {json.dumps(self._create_openai_chunk(completion_id, request.model, '<think>'))}\n\n"
+                                    elif phase != "thinking" and in_thinking_phase:
+                                        in_thinking_phase = False
+                                        yield f"data: {json.dumps(self._create_openai_chunk(completion_id, request.model, '</think>'))}\n\n"
+
+                                # Second, process and emit the actual content.
+                                output_content = ""
                                 if phase == "thinking":
                                     if settings.SHOW_THINK_TAGS:
-                                        cleaned_delta = re.sub(r"<details[^>]*>|<summary>.*?</summary>", "", delta_content, flags=re.DOTALL)
-                                        output_content += cleaned_delta
+                                        output_content = re.sub(r"<details[^>]*>|<summary>.*?</summary>", "", delta_content, flags=re.DOTALL)
                                 elif phase == "answer":
-                                    cleaned_delta = delta_content.replace("</details>", "")
-                                    output_content += cleaned_delta
+                                    output_content = delta_content.replace("</details>", "")
                                 
                                 if output_content:
-                                    openai_chunk = self._create_openai_chunk(completion_id, request.model, output_content)
-                                    yield f"data: {json.dumps(openai_chunk)}\n\n"
+                                    yield f"data: {json.dumps(self._create_openai_chunk(completion_id, request.model, output_content))}\n\n"
 
                             except json.JSONDecodeError:
                                 logger.debug(f"Skipping non-JSON data line: {line}")
                                 continue
 
                 final_chunk = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": request.model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                    "id": completion_id, "object": "chat.completion.chunk", "created": int(time.time()),
+                    "model": request.model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
                 }
                 yield f"data: {json.dumps(final_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
@@ -249,13 +218,6 @@ class ProxyHandler:
     def _create_openai_chunk(self, completion_id: str, model: str, content: str) -> Dict[str, Any]:
         """A helper to create a standard OpenAI stream chunk."""
         return {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {"content": content},
-                "finish_reason": None
-            }]
+            "id": completion_id, "object": "chat.completion.chunk", "created": int(time.time()),
+            "model": model, "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]
         }
