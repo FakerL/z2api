@@ -230,17 +230,13 @@ class ProxyHandler:
                     if not raw_chunk:
                         continue
 
-                    # Add to buffer to handle incomplete events and UTF-8 sequences
                     buffer += raw_chunk
-
-                    # Extract complete events from buffer
                     complete_events, buffer = self._extract_complete_events(buffer)
 
                     for event_text in complete_events:
                         if not event_text or event_text.isspace():
                             continue
 
-                        # Handle Server-Sent Events format
                         lines = event_text.split('\n')
                         for line in lines:
                             line = line.strip()
@@ -251,18 +247,13 @@ class ProxyHandler:
                                 payload = line[6:]
                                 
                                 if payload == '[DONE]':
-                                    # Close thinking tag if still open
                                     if think_open and settings.SHOW_THINK_TAGS:
                                         close_chunk = {
                                             "id": completion_id,
                                             "object": "chat.completion.chunk",
                                             "created": int(time.time()),
                                             "model": request.model,
-                                            "choices": [{
-                                                "index": 0,
-                                                "delta": {"content": "</think>"},
-                                                "finish_reason": None
-                                            }]
+                                            "choices": [{"index": 0, "delta": {"content": "</think>"}, "finish_reason": None}]
                                         }
                                         yield f"data: {json.dumps(close_chunk)}\n\n"
 
@@ -271,17 +262,12 @@ class ProxyHandler:
                                         "object": "chat.completion.chunk",
                                         "created": int(time.time()),
                                         "model": request.model,
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": {},
-                                            "finish_reason": "stop"
-                                        }]
+                                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
                                     }
                                     yield f"data: {json.dumps(final_chunk)}\n\n"
                                     yield "data: [DONE]\n\n"
                                     return
 
-                                # Handle normal JSON
                                 try:
                                     parsed = json.loads(payload)
                                 except json.JSONDecodeError:
@@ -291,59 +277,37 @@ class ProxyHandler:
                                 delta_content = data.get("delta_content", "")
                                 phase = data.get("phase")
 
-                                # Handle phase changes
-                                if phase != current_phase:
+                                # --- START OF FIX ---
+                                # Atomically handle the transition from 'thinking' to 'answer'
+                                # This ensures the </think> tag is prepended to the first answer chunk,
+                                # preventing the first character of the answer from being dropped.
+                                if phase == "answer" and current_phase == "thinking" and think_open and settings.SHOW_THINK_TAGS:
+                                    think_open = False
+                                    current_phase = "answer"
+                                    
+                                    # Combine </think> with the first piece of answer content
+                                    cleaned_first_answer_chunk = self._clean_answer_content(delta_content)
+                                    # Modify delta_content in-place to be processed by the subsequent logic
+                                    delta_content = "</think>" + cleaned_first_answer_chunk
+                                
+                                elif phase and phase != current_phase:
                                     current_phase = phase
-                                    if phase == "answer" and think_open and settings.SHOW_THINK_TAGS:
-                                        # Auto-close thinking phase
-                                        auto_close = {
-                                            "id": completion_id,
-                                            "object": "chat.completion.chunk",
-                                            "created": int(time.time()),
-                                            "model": request.model,
-                                            "choices": [{
-                                                "index": 0,
-                                                "delta": {"content": "</think>"},
-                                                "finish_reason": None
-                                            }]
-                                        }
-                                        yield f"data: {json.dumps(auto_close)}\n\n"
-                                        think_open = False
+                                # --- END OF FIX ---
 
-                                # Decide whether to output content
                                 if phase == "thinking" and not settings.SHOW_THINK_TAGS:
-                                    continue  # Skip thinking content
+                                    continue
 
                                 if delta_content:
+                                    transformed_content = ""
                                     if phase == "thinking" and settings.SHOW_THINK_TAGS:
-                                        # First time entering thinking phase, add <think> tag
                                         if not think_open:
-                                            think_chunk = {
-                                                "id": completion_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": int(time.time()),
-                                                "model": request.model,
-                                                "choices": [{
-                                                    "index": 0,
-                                                    "delta": {"content": "<think>"},
-                                                    "finish_reason": None
-                                                }]
-                                            }
-                                            yield f"data: {json.dumps(think_chunk)}\n\n"
+                                            # Prepend <think> tag to the very first thinking chunk
+                                            delta_content = "<think>" + delta_content
                                             think_open = True
-
-                                    # Transform content based on phase with minimal processing
-                                    if phase == "thinking":
-                                        if settings.SHOW_THINK_TAGS:
-                                            # Minimal cleaning for thinking content
-                                            transformed_content = self._clean_thinking_content(delta_content)
-                                        else:
-                                            continue  # Skip if not showing think tags
-                                    else:
-                                        # For answer phase, minimal cleaning to preserve all content
-                                        transformed_content = self._clean_answer_content(delta_content)
+                                        transformed_content = self._clean_thinking_content(delta_content)
+                                    else: # This now handles 'answer' and our combined '</think>...' chunk
+                                        transformed_content = self._clean_answer_content(delta_content) if phase == "answer" else delta_content
                                     
-                                    # Only yield if there's actual content after transformation
                                     if transformed_content:
                                         chunk = {
                                             "id": completion_id,
@@ -358,38 +322,17 @@ class ProxyHandler:
                                         }
                                         yield f"data: {json.dumps(chunk)}\n\n"
 
-                # Handle any remaining incomplete events in buffer at the end
                 if buffer.strip():
                     logger.warning(f"Incomplete event in buffer at end: {buffer[:100]}...")
 
         except httpx.RequestError as e:
             logger.error(f"Request error: {e}")
-            error_chunk = {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:29]}",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": request.model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"content": f"Connection error: {str(e)}"},
-                    "finish_reason": "stop"
-                }]
-            }
+            error_chunk = { "id": f"chatcmpl-{uuid.uuid4().hex[:29]}", "object": "chat.completion.chunk", "created": int(time.time()), "model": request.model, "choices": [{"index": 0, "delta": {"content": f"Connection error: {str(e)}"}, "finish_reason": "stop"}] }
             yield f"data: {json.dumps(error_chunk)}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as e:
             logger.error(f"Unexpected error in streaming: {e}")
-            error_chunk = {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:29]}",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": request.model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"content": f"Internal error: {str(e)}"},
-                    "finish_reason": "stop"
-                }]
-            }
+            error_chunk = { "id": f"chatcmpl-{uuid.uuid4().hex[:29]}", "object": "chat.completion.chunk", "created": int(time.time()), "model": request.model, "choices": [{"index": 0, "delta": {"content": f"Internal error: {str(e)}"}, "finish_reason": "stop"}] }
             yield f"data: {json.dumps(error_chunk)}\n\n"
             yield "data: [DONE]\n\n"
         finally:
@@ -399,8 +342,8 @@ class ProxyHandler:
     async def non_stream_proxy_response(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         """Handle non-streaming proxy response"""
         client = None
+        cookie = None # Define cookie here to be accessible in except block
         try:
-            # Create a new client for this request
             client = httpx.AsyncClient(
                 timeout=httpx.Timeout(60.0, read=300.0),
                 limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
@@ -411,7 +354,7 @@ class ProxyHandler:
             thinking_buf = []
             answer_buf = []
             current_phase = None
-            buffer = ""  # Buffer for handling incomplete events
+            buffer = ""
 
             async with client.stream("POST", settings.UPSTREAM_URL, json=req_body, headers=headers) as response:
                 if response.status_code != 200:
@@ -421,11 +364,8 @@ class ProxyHandler:
                 async for raw_chunk in response.aiter_text():
                     if not raw_chunk:
                         continue
-
-                    # Add to buffer to handle incomplete events
+                    
                     buffer += raw_chunk
-
-                    # Extract complete events
                     complete_events, buffer = self._extract_complete_events(buffer)
 
                     for event_text in complete_events:
@@ -463,26 +403,23 @@ class ProxyHandler:
                                 elif phase == "answer":
                                     answer_buf.append(delta_content)
 
-            # Combine thinking and answer content
+            # By buffering all content first, the non-streaming mode inherently avoids
+            # the race condition of the streaming mode. The combination logic is robust.
             final_text = ""
+            thinking_text = ""
             
             if settings.SHOW_THINK_TAGS and thinking_buf:
-                # Clean thinking content
                 thinking_raw = "".join(thinking_buf)
                 thinking_text = self._clean_thinking_content(thinking_raw)
-                
-                # Clean answer content minimally
-                answer_raw = "".join(answer_buf) if answer_buf else ""
-                answer_text = self._clean_answer_content(answer_raw)
-                
-                if thinking_text:
-                    final_text = f"<think>{thinking_text}</think>{answer_text}"
-                else:
-                    final_text = answer_text
+
+            answer_raw = "".join(answer_buf)
+            answer_text = self._clean_answer_content(answer_raw)
+            
+            if thinking_text:
+                # Construct the final string carefully to ensure no characters are lost at the boundary
+                final_text = f"<think>{thinking_text}</think>" + answer_text
             else:
-                # Clean answer content minimally
-                answer_raw = "".join(answer_buf)
-                final_text = self._clean_answer_content(answer_raw)
+                final_text = answer_text
 
             return ChatCompletionResponse(
                 id=f"chatcmpl-{uuid.uuid4().hex[:29]}",
@@ -497,7 +434,7 @@ class ProxyHandler:
 
         except httpx.RequestError as e:
             logger.error(f"Request error in non-stream: {e}")
-            if 'cookie' in locals():
+            if cookie:
                 await cookie_manager.mark_cookie_invalid(cookie)
             raise HTTPException(status_code=502, detail="Upstream connection error")
         except Exception as e:
