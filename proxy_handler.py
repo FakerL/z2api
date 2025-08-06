@@ -24,7 +24,12 @@ logger = logging.getLogger(__name__)
 
 class ProxyHandler:
     def __init__(self):
-        self.client = httpx.AsyncClient(timeout=60.0)
+        # Configure httpx client for streaming support
+        self.client = httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0, read=300.0),  # Longer read timeout for streaming
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+            http2=True  # Enable HTTP/2 for better streaming performance
+        )
 
     async def __aenter__(self):
         return self
@@ -161,22 +166,34 @@ class ProxyHandler:
         }
 
         try:
-            response = await self.client.post(
-                settings.UPSTREAM_URL, json=request_data, headers=headers
-            )
+            # Use client.stream() for TRUE streaming response - this is the key fix!
+            async with self.client.stream(
+                "POST",
+                settings.UPSTREAM_URL,
+                json=request_data,
+                headers=headers,
+                timeout=httpx.Timeout(60.0, read=300.0)
+            ) as response:
 
-            if response.status_code == 401:
-                await cookie_manager.mark_cookie_failed(cookie)
-                raise HTTPException(status_code=401, detail="Invalid authentication")
+                if response.status_code == 401:
+                    await cookie_manager.mark_cookie_failed(cookie)
+                    raise HTTPException(status_code=401, detail="Invalid authentication")
 
-            if response.status_code != 200:
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail=f"Upstream error: {response.text}",
-                )
+                if response.status_code != 200:
+                    # For streaming, we need to read the error response properly
+                    try:
+                        error_text = await response.aread()
+                        error_detail = error_text.decode('utf-8')
+                    except:
+                        error_detail = f"HTTP {response.status_code}"
 
-            await cookie_manager.mark_cookie_success(cookie)
-            return {"response": response, "cookie": cookie}
+                    raise HTTPException(
+                        status_code=response.status_code,
+                        detail=f"Upstream error: {error_detail}",
+                    )
+
+                await cookie_manager.mark_cookie_success(cookie)
+                return {"response": response, "cookie": cookie}
 
         except httpx.RequestError as e:
             logger.error(f"Request error: {e}")
@@ -191,16 +208,21 @@ class ProxyHandler:
     async def process_streaming_response(
         self, response: httpx.Response
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Process streaming response from Z.AI"""
+        """Process streaming response from Z.AI - TRUE real-time processing"""
         buffer = ""
 
-        async for chunk in response.aiter_text():
-            buffer += chunk
-            lines = buffer.split("\n")
-            buffer = lines[-1]  # Keep incomplete line in buffer
+        # Use aiter_text with small chunk size for real-time processing
+        async for chunk in response.aiter_text(chunk_size=1024):  # Small chunks for responsiveness
+            if not chunk:
+                continue
 
-            for line in lines[:-1]:
+            buffer += chunk
+
+            # Process complete lines immediately
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
                 line = line.strip()
+
                 if not line.startswith("data: "):
                     continue
 
@@ -223,34 +245,30 @@ class ProxyHandler:
                             status_code=400, detail=f"Upstream error: {error_detail}"
                         )
 
-                    # Transform the response
+                    # Clean up response data
                     if parsed.get("data"):
-                        # Remove unwanted fields
+                        # Remove unwanted fields for cleaner processing
                         parsed["data"].pop("edit_index", None)
                         parsed["data"].pop("edit_content", None)
 
-                        # Note: We don't transform delta_content here because <think> tags
-                        # might span multiple chunks. We'll transform the final aggregated content.
-
+                    # Yield immediately for real-time streaming
                     yield parsed
 
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as e:
+                    logger.debug(f"JSON decode error (skipping): {e}")
                     continue  # Skip non-JSON lines
 
     async def handle_chat_completion(self, request: ChatCompletionRequest):
         """Handle chat completion request"""
-        proxy_result = await self.proxy_request(request)
-        response = proxy_result["response"]
-
         # Determine final streaming mode
         is_streaming = (
             request.stream if request.stream is not None else settings.DEFAULT_STREAM
         )
 
         if is_streaming:
-            # For streaming responses, SHOW_THINK_TAGS setting is ignored
+            # For streaming responses, use direct streaming proxy
             return StreamingResponse(
-                self.stream_response(response, request.model),
+                self.stream_proxy_response(request),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -258,13 +276,125 @@ class ProxyHandler:
                 },
             )
         else:
-            # For non-streaming responses, SHOW_THINK_TAGS setting applies
-            return await self.non_stream_response(response, request.model)
+            # For non-streaming responses, collect all streaming data first
+            chunks = []
+            async for chunk_data in self.stream_proxy_response(request):
+                if chunk_data.startswith("data: ") and not chunk_data.startswith("data: [DONE]"):
+                    try:
+                        chunk_json = json.loads(chunk_data[6:])
+                        if chunk_json.get("choices", [{}])[0].get("delta", {}).get("content"):
+                            chunks.append(chunk_json["choices"][0]["delta"]["content"])
+                    except:
+                        continue
 
-        """Generate streaming response"""
-        async for parsed in self.process_streaming_response(response):
-            yield f"data: {json.dumps(parsed)}\n\n"
-        yield "data: [DONE]\n\n"
+            # Combine all content
+            full_content = "".join(chunks)
+
+            # Return as non-streaming response
+            import time
+            import uuid
+            return ChatCompletionResponse(
+                id=f"chatcmpl-{uuid.uuid4().hex[:29]}",
+                created=int(time.time()),
+                model=request.model,
+                choices=[
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": full_content},
+                        "finish_reason": "stop",
+                    }
+                ],
+            )
+
+    async def stream_response(self, response: httpx.Response, model: str) -> AsyncGenerator[str, None]:
+        """Generate TRUE streaming response in OpenAI format - real-time processing"""
+        import uuid
+        import time
+
+        # Generate a unique completion ID
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+        current_phase = None
+
+        try:
+            # Real-time streaming: process each chunk immediately as it arrives
+            async for parsed in self.process_streaming_response(response):
+                try:
+                    data = parsed.get("data", {})
+                    delta_content = data.get("delta_content", "")
+                    phase = data.get("phase", "")
+
+                    # Track phase changes
+                    if phase != current_phase:
+                        current_phase = phase
+                        logger.debug(f"Phase changed to: {phase}")
+
+                    # Apply filtering based on SHOW_THINK_TAGS and phase
+                    should_send_content = True
+
+                    if not settings.SHOW_THINK_TAGS and phase == "thinking":
+                        # Skip thinking content when SHOW_THINK_TAGS=false
+                        should_send_content = False
+                        logger.debug(f"Skipping thinking content (SHOW_THINK_TAGS=false)")
+
+                    # Process and send content immediately if we should
+                    if delta_content and should_send_content:
+                        # Minimal transformation for real-time streaming
+                        transformed_delta = delta_content
+
+                        if settings.SHOW_THINK_TAGS:
+                            # Simple tag replacement for streaming
+                            transformed_delta = re.sub(r'<details[^>]*>', '<think>', transformed_delta)
+                            transformed_delta = transformed_delta.replace('</details>', '</think>')
+                            # Note: Skip complex regex for streaming performance
+
+                        # Create and send OpenAI-compatible chunk immediately
+                        openai_chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {
+                                    "content": transformed_delta
+                                },
+                                "finish_reason": None
+                            }]
+                        }
+
+                        # Yield immediately for real-time streaming
+                        yield f"data: {json.dumps(openai_chunk)}\n\n"
+
+                except Exception as e:
+                    logger.error(f"Error processing streaming chunk: {e}")
+                    continue
+
+            # Send final completion chunk
+            final_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": "stop"
+                }]
+            }
+
+            yield f"data: {json.dumps(final_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
+
+        except Exception as e:
+            logger.error(f"Streaming error: {e}")
+            # Send error in OpenAI format
+            error_chunk = {
+                "error": {
+                    "message": str(e),
+                    "type": "server_error"
+                }
+            }
+            yield f"data: {json.dumps(error_chunk)}\n\n"
 
     async def non_stream_response(
         self, response: httpx.Response, model: str
@@ -319,3 +449,177 @@ class ProxyHandler:
                 }
             ],
         )
+
+    async def stream_proxy_response(self, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
+        """TRUE streaming proxy - direct pass-through with minimal processing"""
+        import uuid
+        import time
+
+        # Get cookie
+        cookie = await cookie_manager.get_next_cookie()
+        if not cookie:
+            raise HTTPException(status_code=503, detail="No valid authentication available")
+
+        # Prepare request data
+        request_data = request.model_dump(exclude_none=True)
+        target_model = "0727-360B-API"  # Map GLM-4.5 to Z.AI model
+
+        # Build Z.AI request format
+        request_data = {
+            "stream": True,  # Always request streaming from Z.AI
+            "model": target_model,
+            "messages": request_data["messages"],
+            "background_tasks": {
+                "title_generation": True,
+                "tags_generation": True
+            },
+            "chat_id": str(uuid.uuid4()),
+            "features": {
+                "image_generation": False,
+                "code_interpreter": False,
+                "web_search": False,
+                "auto_web_search": False
+            },
+            "id": str(uuid.uuid4()),
+            "mcp_servers": ["deep-web-search"],
+            "model_item": {
+                "id": target_model,
+                "name": "GLM-4.5",
+                "owned_by": "openai"
+            },
+            "params": {},
+            "tool_servers": [],
+            "variables": {
+                "{{USER_NAME}}": "User",
+                "{{USER_LOCATION}}": "Unknown",
+                "{{CURRENT_DATETIME}}": "2025-08-04 16:46:56"
+            }
+        }
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {cookie}",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/event-stream",
+            "Accept-Language": "zh-CN",
+            "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"macOS"',
+            "x-fe-version": "prod-fe-1.0.53",
+            "Origin": "https://chat.z.ai",
+            "Referer": "https://chat.z.ai/c/069723d5-060b-404f-992c-4705f1554c4c",
+        }
+
+        completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+        current_phase = None
+
+        try:
+            # Create a new client for this streaming request to avoid conflicts
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(60.0, read=300.0),
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+                http2=True
+            ) as stream_client:
+                async with stream_client.stream(
+                    "POST",
+                    settings.UPSTREAM_URL,
+                    json=request_data,
+                    headers=headers
+                ) as response:
+
+                    if response.status_code == 401:
+                        await cookie_manager.mark_cookie_failed(cookie)
+                        raise HTTPException(status_code=401, detail="Invalid authentication")
+
+                    if response.status_code != 200:
+                        await cookie_manager.mark_cookie_failed(cookie)
+                        raise HTTPException(status_code=response.status_code, detail="Upstream error")
+
+                    await cookie_manager.mark_cookie_success(cookie)
+
+                    # Process streaming response in real-time
+                    buffer = ""
+                    async for chunk in response.aiter_text(chunk_size=1024):
+                        if not chunk:
+                            continue
+
+                        buffer += chunk
+
+                        # Process complete lines immediately
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.strip()
+
+                            if not line.startswith("data: "):
+                                continue
+
+                            payload = line[6:].strip()
+                            if payload == "[DONE]":
+                                # Send final chunk and done
+                                final_chunk = {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": request.model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": "stop"
+                                    }]
+                                }
+                                yield f"data: {json.dumps(final_chunk)}\n\n"
+                                yield "data: [DONE]\n\n"
+                                return
+
+                            try:
+                                parsed = json.loads(payload)
+                                data = parsed.get("data", {})
+                                delta_content = data.get("delta_content", "")
+                                phase = data.get("phase", "")
+
+                                # Track phase changes
+                                if phase != current_phase:
+                                    current_phase = phase
+                                    logger.debug(f"Phase changed to: {phase}")
+
+                                # Apply filtering based on SHOW_THINK_TAGS and phase
+                                should_send_content = True
+
+                                if not settings.SHOW_THINK_TAGS and phase == "thinking":
+                                    should_send_content = False
+
+                                # Process and send content immediately if we should
+                                if delta_content and should_send_content:
+                                    # Minimal transformation for real-time streaming
+                                    transformed_delta = delta_content
+
+                                    if settings.SHOW_THINK_TAGS:
+                                        # Simple tag replacement for streaming
+                                        transformed_delta = re.sub(r'<details[^>]*>', '<think>', transformed_delta)
+                                        transformed_delta = transformed_delta.replace('</details>', '</think>')
+
+                                    # Create and send OpenAI-compatible chunk immediately
+                                    openai_chunk = {
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": request.model,
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {
+                                                "content": transformed_delta
+                                            },
+                                            "finish_reason": None
+                                        }]
+                                    }
+
+                                    # Yield immediately for real-time streaming
+                                    yield f"data: {json.dumps(openai_chunk)}\n\n"
+
+                            except json.JSONDecodeError:
+                                continue  # Skip non-JSON lines
+
+        except httpx.RequestError as e:
+            logger.error(f"Streaming request error: {e}")
+            await cookie_manager.mark_cookie_failed(cookie)
+            raise HTTPException(status_code=503, detail=f"Upstream service unavailable: {str(e)}")
