@@ -43,7 +43,7 @@ class ProxyHandler:
             return content
 
         logger.debug(f"SHOW_THINK_TAGS setting: {settings.SHOW_THINK_TAGS}")
-        logger.debug(f"Original content: {content[:200]}...")
+        logger.debug(f"Original content length: {len(content)}")
 
         # Optionally remove thinking content based on configuration
         if not settings.SHOW_THINK_TAGS:
@@ -91,17 +91,9 @@ class ProxyHandler:
                 think_start = content.find("<think>")
                 if think_start != -1:
                     # Look for where the actual answer begins
-                    # This is typically after the thinking content, marked by:
-                    # 1. A line that starts with normal text (not continuation of thinking)
-                    # 2. Often starts with a capital letter
-                    # 3. Might be after some whitespace/newlines
-                    
                     search_content = content[think_start + 7:]  # Skip "<think>"
                     
                     # Look for patterns that indicate the start of the answer:
-                    # - New paragraph with capital letter
-                    # - Numbered list
-                    # - Clear sentence structure
                     patterns = [
                         r'\n\n+([A-Z][^<\n]*)',  # New paragraph starting with capital
                         r'\n\n+(\d+\.)',         # Numbered list
@@ -114,7 +106,7 @@ class ProxyHandler:
                         match = re.search(pattern, search_content)
                         if match:
                             answer_start = think_start + 7 + match.start()
-                            logger.debug(f"Found answer start at position {answer_start} with pattern: {pattern}")
+                            logger.debug(f"Found answer start at position {answer_start}")
                             break
                     
                     if answer_start:
@@ -128,7 +120,7 @@ class ProxyHandler:
             # Clean up multiple newlines and spacing
             content = re.sub(r'\n\s*\n\s*\n+', '\n\n', content)
 
-        logger.debug(f"Final transformed content: {content[:200]}...")
+        logger.debug(f"Final transformed content length: {len(content)}")
         return content.strip()
 
     async def proxy_request(self, request: ChatCompletionRequest) -> Dict[str, Any]:
@@ -376,33 +368,38 @@ class ProxyHandler:
 
                     # Process and send content immediately if we should
                     if delta_content and should_send_content:
-                        # Minimal transformation for real-time streaming
+                        # Minimal transformation for real-time streaming - NO TAG PROCESSING!
                         transformed_delta = delta_content
 
-                        if settings.SHOW_THINK_TAGS:
-                            # Simple tag replacement for streaming
-                            transformed_delta = re.sub(r'<details[^>]*>', '<think>', transformed_delta)
-                            transformed_delta = transformed_delta.replace('</details>', '</think>')
-                            # Remove summary tags for streaming
-                            transformed_delta = re.sub(r"<summary>.*?</summary>", "", transformed_delta, flags=re.DOTALL)
+                        # Only do basic replacements without complex regex for streaming
+                        if settings.SHOW_THINK_TAGS and ('<details' in transformed_delta or '</details>' in transformed_delta):
+                            # Simple string replacement only
+                            if '<details' in transformed_delta:
+                                transformed_delta = '<think>'
+                            elif '</details>' in transformed_delta:
+                                transformed_delta = '</think>'
+                            # Remove summary content if present
+                            if '<summary>' in transformed_delta or '</summary>' in transformed_delta:
+                                transformed_delta = ''  # Skip summary content entirely
 
                         # Create and send OpenAI-compatible chunk immediately
-                        openai_chunk = {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {
-                                    "content": transformed_delta
-                                },
-                                "finish_reason": None
-                            }]
-                        }
+                        if transformed_delta:  # Only send if there's actual content
+                            openai_chunk = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {
+                                        "content": transformed_delta
+                                    },
+                                    "finish_reason": None
+                                }]
+                            }
 
-                        # Yield immediately for real-time streaming
-                        yield f"data: {json.dumps(openai_chunk)}\n\n"
+                            # Yield immediately for real-time streaming
+                            yield f"data: {json.dumps(openai_chunk)}\n\n"
 
                 except Exception as e:
                     logger.error(f"Error processing streaming chunk: {e}")
@@ -552,7 +549,6 @@ class ProxyHandler:
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         current_phase = None
-        collected_content = ""  # For post-processing in non-streaming mode
 
         try:
             # Create a new client for this streaming request to avoid conflicts
@@ -596,21 +592,20 @@ class ProxyHandler:
 
                             payload = line[6:].strip()
                             if payload == "[DONE]":
-                                # For streaming mode, just send the final chunk and done
-                                if request.stream:
-                                    final_chunk = {
-                                        "id": completion_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": int(time.time()),
-                                        "model": request.model,
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": {},
-                                            "finish_reason": "stop"
-                                        }]
-                                    }
-                                    yield f"data: {json.dumps(final_chunk)}\n\n"
-                                    yield "data: [DONE]\n\n"
+                                # Send final chunk and done
+                                final_chunk = {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": request.model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {},
+                                        "finish_reason": "stop"
+                                    }]
+                                }
+                                yield f"data: {json.dumps(final_chunk)}\n\n"
+                                yield "data: [DONE]\n\n"
                                 return
 
                             try:
@@ -624,44 +619,46 @@ class ProxyHandler:
                                     current_phase = phase
                                     logger.debug(f"Phase changed to: {phase}")
 
-                                # Collect content for potential post-processing
-                                if delta_content:
-                                    collected_content += delta_content
-
                                 # Apply filtering based on SHOW_THINK_TAGS and phase
                                 should_send_content = True
 
                                 if not settings.SHOW_THINK_TAGS and phase == "thinking":
                                     should_send_content = False
 
-                                # Process and send content immediately if we should (for streaming)
-                                if delta_content and should_send_content and request.stream:
-                                    # Minimal transformation for real-time streaming
+                                # Process and send content immediately if we should
+                                if delta_content and should_send_content:
+                                    # CRITICAL FIX: For streaming, do MINIMAL processing
                                     transformed_delta = delta_content
 
+                                    # Only do safe replacements for streaming
                                     if settings.SHOW_THINK_TAGS:
-                                        # Simple tag replacement for streaming
-                                        transformed_delta = re.sub(r'<details[^>]*>', '<think>', transformed_delta)
-                                        transformed_delta = transformed_delta.replace('</details>', '</think>')
-                                        transformed_delta = re.sub(r"<summary>.*?</summary>", "", transformed_delta, flags=re.DOTALL)
+                                        # Check for complete tag patterns only
+                                        if transformed_delta == '<details>' or '<details ' in transformed_delta:
+                                            transformed_delta = '<think>'
+                                        elif transformed_delta == '</details>':
+                                            transformed_delta = '</think>'
+                                        elif '<summary>' in transformed_delta or '</summary>' in transformed_delta:
+                                            # Skip summary content entirely
+                                            continue
 
                                     # Create and send OpenAI-compatible chunk immediately
-                                    openai_chunk = {
-                                        "id": completion_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": int(time.time()),
-                                        "model": request.model,
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": {
-                                                "content": transformed_delta
-                                            },
-                                            "finish_reason": None
-                                        }]
-                                    }
+                                    if transformed_delta:  # Only send if there's content
+                                        openai_chunk = {
+                                            "id": completion_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": int(time.time()),
+                                            "model": request.model,
+                                            "choices": [{
+                                                "index": 0,
+                                                "delta": {
+                                                    "content": transformed_delta
+                                                },
+                                                "finish_reason": None
+                                            }]
+                                        }
 
-                                    # Yield immediately for real-time streaming
-                                    yield f"data: {json.dumps(openai_chunk)}\n\n"
+                                        # Yield immediately for real-time streaming
+                                        yield f"data: {json.dumps(openai_chunk)}\n\n"
 
                             except json.JSONDecodeError:
                                 continue  # Skip non-JSON lines
