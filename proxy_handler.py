@@ -7,7 +7,7 @@ import logging
 import re
 import time
 import uuid
-from typing import AsyncGenerator, Dict, Any
+from typing import AsyncGenerator, Dict, Any, Tuple
 
 import httpx
 from fastapi import HTTPException
@@ -61,8 +61,29 @@ class ProxyHandler:
 
         return content.strip()
 
+    def _serialize_messages(self, messages) -> list:
+        """Convert ChatMessage objects to dict format for JSON serialization"""
+        serialized_messages = []
+        for message in messages:
+            if hasattr(message, 'dict'):
+                # Pydantic model
+                serialized_messages.append(message.dict())
+            elif hasattr(message, 'model_dump'):
+                # Pydantic v2 model
+                serialized_messages.append(message.model_dump())
+            elif isinstance(message, dict):
+                # Already a dict
+                serialized_messages.append(message)
+            else:
+                # Try to convert to dict
+                serialized_messages.append({
+                    "role": getattr(message, 'role', 'user'),
+                    "content": getattr(message, 'content', str(message))
+                })
+        return serialized_messages
+
     # Upstream communication
-    async def _prepare_upstream(self, request: ChatCompletionRequest) -> (Dict[str, Any], str, str):
+    async def _prepare_upstream(self, request: ChatCompletionRequest) -> Tuple[Dict[str, Any], Dict[str, str], str]:
         """Prepare request body and headers for upstream API"""
         cookie = await cookie_manager.get_next_cookie()
         if not cookie:
@@ -70,10 +91,13 @@ class ProxyHandler:
 
         target_model = settings.UPSTREAM_MODEL if request.model == settings.MODEL_NAME else request.model
 
+        # Serialize messages to dict format
+        serialized_messages = self._serialize_messages(request.messages)
+
         req_body = {
             "stream": True,
             "model": target_model,
-            "messages": request.messages,
+            "messages": serialized_messages,
             "background_tasks": {"title_generation": True, "tags_generation": True},
             "chat_id": str(uuid.uuid4()),
             "features": {
@@ -116,16 +140,29 @@ class ProxyHandler:
     # Main streaming logic
     async def stream_proxy_response(self, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
         """Handle streaming proxy response"""
-        req_body, headers, cookie = await self._prepare_upstream(request)
-        completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-        think_open = False  # Track if <think> tag is open
-        current_phase = None
-
         try:
+            req_body, headers, cookie = await self._prepare_upstream(request)
+            completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+            think_open = False  # Track if <think> tag is open
+            current_phase = None
+
             async with self.client.stream("POST", settings.UPSTREAM_URL, json=req_body, headers=headers) as response:
                 if response.status_code != 200:
                     await cookie_manager.mark_cookie_invalid(cookie)
-                    raise HTTPException(status_code=response.status_code, detail="Upstream API error")
+                    error_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": request.model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": f"Error: Upstream API returned {response.status_code}"},
+                            "finish_reason": "stop"
+                        }]
+                    }
+                    yield f"data: {json.dumps(error_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
 
                 async for raw_chunk in response.aiter_text():
                     if not raw_chunk or raw_chunk.isspace():
@@ -225,36 +262,61 @@ class ProxyHandler:
 
                                 # Transform content
                                 transformed_content = self.transform_content(delta_content)
-
-                                chunk = {
-                                    "id": completion_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": int(time.time()),
-                                    "model": request.model,
-                                    "choices": [{
-                                        "index": 0,
-                                        "delta": {"content": transformed_content},
-                                        "finish_reason": None
-                                    }]
-                                }
-                                yield f"data: {json.dumps(chunk)}\n\n"
+                                if transformed_content:  # Only yield if there's content
+                                    chunk = {
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": int(time.time()),
+                                        "model": request.model,
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {"content": transformed_content},
+                                            "finish_reason": None
+                                        }]
+                                    }
+                                    yield f"data: {json.dumps(chunk)}\n\n"
 
         except httpx.RequestError as e:
-            await cookie_manager.mark_cookie_invalid(cookie)
             logger.error(f"Request error: {e}")
-            raise HTTPException(status_code=502, detail="Upstream connection error")
+            # Yield error message as streaming response
+            error_chunk = {
+                "id": f"chatcmpl-{uuid.uuid4().hex[:29]}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": request.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": f"Connection error: {str(e)}"},
+                    "finish_reason": "stop"
+                }]
+            }
+            yield f"data: {json.dumps(error_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
         except Exception as e:
-            logger.error(f"Unexpected error: {e}")
-            raise HTTPException(status_code=500, detail="Internal server error")
+            logger.error(f"Unexpected error in streaming: {e}")
+            # Yield error message as streaming response
+            error_chunk = {
+                "id": f"chatcmpl-{uuid.uuid4().hex[:29]}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": request.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": f"Internal error: {str(e)}"},
+                    "finish_reason": "stop"
+                }]
+            }
+            yield f"data: {json.dumps(error_chunk)}\n\n"
+            yield "data: [DONE]\n\n"
 
     async def non_stream_proxy_response(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         """Handle non-streaming proxy response"""
-        req_body, headers, cookie = await self._prepare_upstream(request)
-        thinking_buf = []
-        answer_buf = []
-        current_phase = None
-
         try:
+            req_body, headers, cookie = await self._prepare_upstream(request)
+            thinking_buf = []
+            answer_buf = []
+            current_phase = None
+
             async with self.client.stream("POST", settings.UPSTREAM_URL, json=req_body, headers=headers) as response:
                 if response.status_code != 200:
                     await cookie_manager.mark_cookie_invalid(cookie)
@@ -267,7 +329,10 @@ class ProxyHandler:
                     lines = raw_chunk.split('\n')
                     for line in lines:
                         line = line.strip()
-                        if not line or line.startswith(':') or not line.startswith('data: '):
+                        if not line or line.startswith(':'):
+                            continue
+                        
+                        if not line.startswith('data: '):
                             continue
 
                         payload = line[6:]
@@ -294,7 +359,7 @@ class ProxyHandler:
 
             # Combine thinking and answer content
             if settings.SHOW_THINK_TAGS and thinking_buf:
-                thinking_text = "<think>" + "".join(thinking_buf) + "</think>" if thinking_buf else ""
+                thinking_text = "<think>" + "".join(thinking_buf) + "</think>"
                 final_text = thinking_text + "".join(answer_buf)
             else:
                 final_text = "".join(answer_buf)
@@ -313,11 +378,12 @@ class ProxyHandler:
             )
 
         except httpx.RequestError as e:
-            await cookie_manager.mark_cookie_invalid(cookie)
-            logger.error(f"Request error: {e}")
+            logger.error(f"Request error in non-stream: {e}")
+            if 'cookie' in locals():
+                await cookie_manager.mark_cookie_invalid(cookie)
             raise HTTPException(status_code=502, detail="Upstream connection error")
         except Exception as e:
-            logger.error(f"Unexpected error: {e}")
+            logger.error(f"Unexpected error in non-stream: {e}")
             raise HTTPException(status_code=500, detail="Internal server error")
 
     # FastAPI entry point
