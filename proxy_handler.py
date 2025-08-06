@@ -49,16 +49,16 @@ class ProxyHandler:
             logger.debug("Removing thinking content from response")
             original_length = len(content)
 
-            # Remove <thinking>...</thinking> blocks (thinking content) - handle both closed and unclosed tags
-            # First try to remove complete <thinking>...</thinking> blocks
+            # Remove <details> blocks (thinking content) - handle both closed and unclosed tags
+            # First try to remove complete <details>...</details> blocks
             content = re.sub(
-                r"<thinking>.*?</thinking>", "", content, flags=re.DOTALL
+                r"<details[^>]*>.*?</details>", "", content, flags=re.DOTALL
             )
 
-            # Then remove any remaining <thinking> opening tags and everything after them until we hit answer content
-            # Look for pattern: <thinking>...content... and remove the thinking part
+            # Then remove any remaining <details> opening tags and everything after them until we hit answer content
+            # Look for pattern: <details...><summary>...</summary>...content... and remove the thinking part
             content = re.sub(
-                r"<thinking>.*?(?=\s[A-Z]|\s\d|\s*$)",
+                r"<details[^>]*>.*?(?=\s*[A-Z]|\s*\d|\s*$)",
                 "",
                 content,
                 flags=re.DOTALL,
@@ -70,29 +70,29 @@ class ProxyHandler:
                 f"Content length after removing thinking content: {original_length} -> {len(content)}"
             )
         else:
-            logger.debug("Keeping thinking content, converting to <thinking>...</thinking>")
+            logger.debug("Keeping thinking content, converting to <think> tags")
 
-            # Remove <thinking> tags and their content
-            content = re.sub(r"<thinking>(.*?)</thinking>", r"<thinking>\1</thinking>", content, flags=re.DOTALL)
+            # Replace <details> with <think>
+            content = re.sub(r"<details[^>]*>", "<think>", content)
+            content = content.replace("</details>", "</think>")
 
-            # If there's no closing </thinking>, add it at the end of thinking content
-            if "<thinking>" in content:
+            # Remove <summary> tags and their content
+            content = re.sub(r"<summary>.*?</summary>", "", content, flags=re.DOTALL)
+
+            # If there's no closing </think>, add it at the end of thinking content
+            if "<think>" in content and "</think>" not in content:
                 # Find where thinking ends and answer begins
-                think_start = content.find("<thinking>")
+                think_start = content.find("<think>")
                 if think_start != -1:
-                    # Look for typical answer patterns after thinking
-                    patterns = [r"\n[A-Z]", r"\n\d+\.", r"\nTo ", r"\nThe "]
-                    
-                    for pattern in patterns:
-                        match = re.search(pattern, content[think_start:])
-                        if match:
-                            insert_pos = think_start + match.start()
-                            content = (
-                                content[:insert_pos].replace("<thinking>", "<thinking>") +
-                                "</thinking>\n" + content[insert_pos:]
-                            )
-                        else:
-                            content += "</thinking>"
+                    # Look for the start of the actual answer (usually starts with a capital letter or number)
+                    answer_match = re.search(r"\n\s*[A-Z0-9]", content[think_start:])
+                    if answer_match:
+                        insert_pos = think_start + answer_match.start()
+                        content = (
+                            content[:insert_pos] + "</think>\n" + content[insert_pos:]
+                        )
+                    else:
+                        content += "</think>"
 
         return content.strip()
 
@@ -343,7 +343,8 @@ class ProxyHandler:
 
                         if settings.SHOW_THINK_TAGS:
                             # Simple tag replacement for streaming
-                            transformed_delta = re.sub(r'<thinking[^>]*>', '<thinking>', transformed_delta)
+                            transformed_delta = re.sub(r'<details[^>]*>', '<think>', transformed_delta)
+                            transformed_delta = transformed_delta.replace('</details>', '</think>')
                             # Note: Skip complex regex for streaming performance
 
                         # Create and send OpenAI-compatible chunk immediately
@@ -510,7 +511,7 @@ class ProxyHandler:
         }
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-        current_phase = None
+        last_phase = None
 
         try:
             # Create a new client for this streaming request to avoid conflicts
@@ -574,29 +575,32 @@ class ProxyHandler:
                                 parsed = json.loads(payload)
                                 data = parsed.get("data", {})
                                 delta_content = data.get("delta_content", "")
-                                phase = data.get("phase", "")
+                                phase = data.get("phase", "").strip()
 
-                                # Track phase changes
-                                if phase != current_phase:
-                                    current_phase = phase
-                                    logger.debug(f"Phase changed to: {phase}")
+                                output_content = None
 
-                                # Apply filtering based on SHOW_THINK_TAGS and phase
-                                should_send_content = True
+                                if settings.SHOW_THINK_TAGS:
+                                    content_to_process = delta_content
+                                    if phase == "thinking" and last_phase != "thinking":
+                                        temp_content = re.sub(r"<details.*?>\s*<summary>.*?</summary>", "", content_to_process, flags=re.DOTALL).lstrip()
+                                        output_content = "<think>" + temp_content
+                                    elif phase == "answer" and last_phase == "thinking":
+                                        output_content = content_to_process.replace("</details>", "</think>", 1)
+                                    else:
+                                        output_content = content_to_process
+                                else:
+                                    if phase == "thinking":
+                                        output_content = ""
+                                    else:
+                                        content_to_process = delta_content
+                                        if last_phase == "thinking":
+                                            content_to_process = content_to_process.replace("</details>", "", 1)
+                                        output_content = content_to_process
+                                
+                                if phase in ["thinking", "answer"]:
+                                    last_phase = phase
 
-                                if not settings.SHOW_THINK_TAGS and phase == "thinking":
-                                    should_send_content = False
-
-                                # Process and send content immediately if we should
-                                if delta_content and should_send_content:
-                                    # Minimal transformation for real-time streaming
-                                    transformed_delta = delta_content
-
-                                    if settings.SHOW_THINK_TAGS:
-                                        # Simple tag replacement for streaming
-                                        transformed_delta = re.sub(r'<thinking[^>]*>', '<thinking>', transformed_delta)
-
-                                    # Create and send OpenAI-compatible chunk immediately
+                                if output_content:
                                     openai_chunk = {
                                         "id": completion_id,
                                         "object": "chat.completion.chunk",
@@ -605,17 +609,15 @@ class ProxyHandler:
                                         "choices": [{
                                             "index": 0,
                                             "delta": {
-                                                "content": transformed_delta
+                                                "content": output_content
                                             },
                                             "finish_reason": None
                                         }]
                                     }
-
-                                    # Yield immediately for real-time streaming
                                     yield f"data: {json.dumps(openai_chunk)}\n\n"
 
                             except json.JSONDecodeError:
-                                continue  # Skip non-JSON lines
+                                continue
 
         except httpx.RequestError as e:
             logger.error(f"Streaming request error: {e}")
