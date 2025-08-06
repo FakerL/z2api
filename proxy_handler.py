@@ -23,17 +23,23 @@ logger = logging.getLogger(__name__)
 
 
 class ProxyHandler:
-    # The handler is now stateless. It does not hold an httpx.AsyncClient instance.
     def __init__(self):
+        """
+        The handler is stateless. It does not hold long-lived resources like an httpx.AsyncClient.
+        """
         pass
 
-    # The __aenter__ and __aexit__ methods are no longer necessary as the handler
-    # itself doesn't manage any resources that need explicit cleanup.
-    # async def __aenter__(self):
-    #     return self
-    #
-    # async def __aexit__(self, exc_type, exc_val, exc_tb):
-    #     pass
+    async def __aenter__(self):
+        """
+        Provide an empty async context manager entry to be compatible with `async with` usage in main.py.
+        """
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """
+        Provide an empty async context manager exit. No resources to clean up here.
+        """
+        pass
 
     async def handle_chat_completion(self, request: ChatCompletionRequest):
         """Handle chat completion request by streaming or aggregating."""
@@ -146,8 +152,6 @@ class ProxyHandler:
         in_thinking_phase = False
         buffer = ""
 
-        # KEY FIX: Create the client inside the generator function.
-        # This ensures its lifecycle is tied to a single request.
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(60.0, read=300.0),
             limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
@@ -226,7 +230,6 @@ class ProxyHandler:
                                 logger.debug(f"Skipping non-JSON data line: {line}")
                                 continue
 
-                # After the loop finishes, send the final [DONE] message.
                 final_chunk = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
