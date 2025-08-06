@@ -43,6 +43,7 @@ class ProxyHandler:
             return content
 
         logger.debug(f"SHOW_THINK_TAGS setting: {settings.SHOW_THINK_TAGS}")
+        logger.debug(f"Original content: {content[:200]}...")
 
         # Optionally remove thinking content based on configuration
         if not settings.SHOW_THINK_TAGS:
@@ -94,6 +95,7 @@ class ProxyHandler:
                     else:
                         content += "</think>"
 
+        logger.debug(f"Transformed content: {content[:200]}...")
         return content.strip()
 
     async def proxy_request(self, request: ChatCompletionRequest) -> Dict[str, Any]:
@@ -113,10 +115,6 @@ class ProxyHandler:
         is_streaming = (
             request.stream if request.stream is not None else settings.DEFAULT_STREAM
         )
-
-        # Validate parameter compatibility
-        if is_streaming and not settings.SHOW_THINK_TAGS:
-            logger.warning("SHOW_THINK_TAGS=false is ignored for streaming responses")
 
         # Prepare request data
         request_data = request.model_dump(exclude_none=True)
@@ -154,15 +152,20 @@ class ProxyHandler:
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {cookie}",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/event-stream",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "*/*",
             "Accept-Language": "zh-CN",
-            "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"macOS"',
-            "x-fe-version": "prod-fe-1.0.53",
+            "Connection": "keep-alive",
             "Origin": "https://chat.z.ai",
-            "Referer": "https://chat.z.ai/c/069723d5-060b-404f-992c-4705f1554c4c",
+            "Referer": "https://chat.z.ai/",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "X-FE-Version": "prod-fe-1.0.57",
+            "X-KL-kfa-Ajax-Request": "Ajax_Request",
+            "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
         }
 
         try:
@@ -249,7 +252,7 @@ class ProxyHandler:
                     if parsed.get("data"):
                         # Remove unwanted fields for cleaner processing
                         parsed["data"].pop("edit_index", None)
-                        parsed["data"].pop("edit_content", None)
+                        # Keep edit_content as it might contain the full response
 
                     # Yield immediately for real-time streaming
                     yield parsed
@@ -306,129 +309,52 @@ class ProxyHandler:
                 ],
             )
 
-    async def stream_response(self, response: httpx.Response, model: str) -> AsyncGenerator[str, None]:
-        """Generate TRUE streaming response in OpenAI format - real-time processing"""
-        import uuid
-        import time
-
-        # Generate a unique completion ID
-        completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-        current_phase = None
-
-        try:
-            # Real-time streaming: process each chunk immediately as it arrives
-            async for parsed in self.process_streaming_response(response):
-                try:
-                    data = parsed.get("data", {})
-                    delta_content = data.get("delta_content", "")
-                    phase = data.get("phase", "")
-
-                    # Track phase changes
-                    if phase != current_phase:
-                        current_phase = phase
-                        logger.debug(f"Phase changed to: {phase}")
-
-                    # Apply filtering based on SHOW_THINK_TAGS and phase
-                    should_send_content = True
-
-                    if not settings.SHOW_THINK_TAGS and phase == "thinking":
-                        # Skip thinking content when SHOW_THINK_TAGS=false
-                        should_send_content = False
-                        logger.debug(f"Skipping thinking content (SHOW_THINK_TAGS=false)")
-
-                    # Process and send content immediately if we should
-                    if delta_content and should_send_content:
-                        # Minimal transformation for real-time streaming
-                        transformed_delta = delta_content
-
-                        if settings.SHOW_THINK_TAGS:
-                            # Simple tag replacement for streaming
-                            transformed_delta = re.sub(r'<details[^>]*>', '<think>', transformed_delta)
-                            transformed_delta = transformed_delta.replace('</details>', '</think>')
-                            # Note: Skip complex regex for streaming performance
-
-                        # Create and send OpenAI-compatible chunk immediately
-                        openai_chunk = {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {
-                                    "content": transformed_delta
-                                },
-                                "finish_reason": None
-                            }]
-                        }
-
-                        # Yield immediately for real-time streaming
-                        yield f"data: {json.dumps(openai_chunk)}\n\n"
-
-                except Exception as e:
-                    logger.error(f"Error processing streaming chunk: {e}")
-                    continue
-
-            # Send final completion chunk
-            final_chunk = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": "stop"
-                }]
-            }
-
-            yield f"data: {json.dumps(final_chunk)}\n\n"
-            yield "data: [DONE]\n\n"
-
-        except Exception as e:
-            logger.error(f"Streaming error: {e}")
-            # Send error in OpenAI format
-            error_chunk = {
-                "error": {
-                    "message": str(e),
-                    "type": "server_error"
-                }
-            }
-            yield f"data: {json.dumps(error_chunk)}\n\n"
-
     async def non_stream_response(
         self, response: httpx.Response, model: str
     ) -> ChatCompletionResponse:
         """Generate non-streaming response"""
         chunks = []
+        final_edit_content = None
+        
         async for parsed in self.process_streaming_response(response):
             chunks.append(parsed)
-            logger.debug(f"Received chunk: {parsed}")  # Debug log
+            logger.debug(f"Received chunk: {parsed}")
+            
+            # Check if this chunk has edit_content (final complete content)
+            data = parsed.get("data", {})
+            if "edit_content" in data and data.get("phase") in ["answer", "other"]:
+                final_edit_content = data["edit_content"]
+                logger.debug(f"Found final edit_content: {final_edit_content[:200]}...")
 
         if not chunks:
             raise HTTPException(status_code=500, detail="No response from upstream")
 
         logger.info(f"Total chunks received: {len(chunks)}")
-        logger.debug(f"First chunk structure: {chunks[0] if chunks else 'None'}")
 
-        # Aggregate content based on SHOW_THINK_TAGS setting
-        if settings.SHOW_THINK_TAGS:
-            # Include all content
-            full_content = "".join(
-                chunk.get("data", {}).get("delta_content", "") for chunk in chunks
-            )
+        # Use edit_content if available (contains complete formatted content)
+        if final_edit_content:
+            logger.info("Using final edit_content for complete response")
+            full_content = final_edit_content
         else:
-            # Only include answer phase content
-            full_content = "".join(
-                chunk.get("data", {}).get("delta_content", "")
-                for chunk in chunks
-                if chunk.get("data", {}).get("phase") == "answer"
-            )
+            # Fallback: aggregate content based on SHOW_THINK_TAGS setting
+            logger.info("Falling back to aggregating delta_content")
+            if settings.SHOW_THINK_TAGS:
+                # Include all content from both thinking and answer phases
+                full_content = "".join(
+                    chunk.get("data", {}).get("delta_content", "") 
+                    for chunk in chunks
+                    if chunk.get("data", {}).get("delta_content")
+                )
+            else:
+                # Only include answer phase content
+                full_content = "".join(
+                    chunk.get("data", {}).get("delta_content", "")
+                    for chunk in chunks
+                    if chunk.get("data", {}).get("phase") == "answer"
+                )
 
         logger.info(f"Aggregated content length: {len(full_content)}")
-        logger.debug(
-            f"Full aggregated content: {full_content}"
-        )  # Show full content for debugging
+        logger.debug(f"Full aggregated content: {full_content}")
 
         # Apply content transformation (including think tag filtering)
         transformed_content = self.transform_content(full_content)
@@ -499,19 +425,26 @@ class ProxyHandler:
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {cookie}",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-            "Accept": "application/json, text/event-stream",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "*/*",
             "Accept-Language": "zh-CN",
-            "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"macOS"',
-            "x-fe-version": "prod-fe-1.0.53",
+            "Connection": "keep-alive",
             "Origin": "https://chat.z.ai",
-            "Referer": "https://chat.z.ai/c/069723d5-060b-404f-992c-4705f1554c4c",
+            "Referer": "https://chat.z.ai/",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "X-FE-Version": "prod-fe-1.0.57",
+            "X-KL-kfa-Ajax-Request": "Ajax_Request",
+            "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
         }
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         current_phase = None
+        thinking_buffer = ""  # Buffer to collect thinking content
+        has_sent_thinking_start = False
 
         try:
             # Create a new client for this streaming request to avoid conflicts
@@ -576,45 +509,90 @@ class ProxyHandler:
                                 data = parsed.get("data", {})
                                 delta_content = data.get("delta_content", "")
                                 phase = data.get("phase", "")
+                                edit_content = data.get("edit_content", "")
 
                                 # Track phase changes
                                 if phase != current_phase:
                                     current_phase = phase
                                     logger.debug(f"Phase changed to: {phase}")
 
-                                # Apply filtering based on SHOW_THINK_TAGS and phase
-                                should_send_content = True
-
-                                if not settings.SHOW_THINK_TAGS and phase == "thinking":
-                                    should_send_content = False
-
-                                # Process and send content immediately if we should
-                                if delta_content and should_send_content:
-                                    # Minimal transformation for real-time streaming
-                                    transformed_delta = delta_content
-
+                                # Handle different phases
+                                if phase == "thinking":
                                     if settings.SHOW_THINK_TAGS:
-                                        # Simple tag replacement for streaming
-                                        transformed_delta = re.sub(r'<details[^>]*>', '<think>', transformed_delta)
-                                        transformed_delta = transformed_delta.replace('</details>', '</think>')
+                                        # Send thinking content with <think> tags
+                                        if not has_sent_thinking_start and delta_content:
+                                            # First thinking content - add opening <think> tag
+                                            # Remove <details> and <summary> tags from delta content
+                                            clean_delta = re.sub(r'<details[^>]*>', '', delta_content)
+                                            clean_delta = re.sub(r'<summary>.*?</summary>', '', clean_delta, flags=re.DOTALL)
+                                            
+                                            transformed_delta = "<think>" + clean_delta
+                                            has_sent_thinking_start = True
+                                        else:
+                                            # Subsequent thinking content
+                                            transformed_delta = delta_content
+                                        
+                                        if transformed_delta:
+                                            openai_chunk = {
+                                                "id": completion_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": request.model,
+                                                "choices": [{
+                                                    "index": 0,
+                                                    "delta": {
+                                                        "content": transformed_delta
+                                                    },
+                                                    "finish_reason": None
+                                                }]
+                                            }
+                                            yield f"data: {json.dumps(openai_chunk)}\n\n"
+                                    # If SHOW_THINK_TAGS=false, skip thinking content entirely
 
-                                    # Create and send OpenAI-compatible chunk immediately
-                                    openai_chunk = {
-                                        "id": completion_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": int(time.time()),
-                                        "model": request.model,
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": {
-                                                "content": transformed_delta
-                                            },
-                                            "finish_reason": None
-                                        }]
-                                    }
+                                elif phase == "answer":
+                                    # Handle answer phase
+                                    if settings.SHOW_THINK_TAGS and has_sent_thinking_start and delta_content:
+                                        # Close thinking tag before answer content
+                                        close_think_chunk = {
+                                            "id": completion_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": int(time.time()),
+                                            "model": request.model,
+                                            "choices": [{
+                                                "index": 0,
+                                                "delta": {
+                                                    "content": "</think>\n\n"
+                                                },
+                                                "finish_reason": None
+                                            }]
+                                        }
+                                        yield f"data: {json.dumps(close_think_chunk)}\n\n"
+                                        has_sent_thinking_start = False
+                                    
+                                    # Send answer content (for both SHOW_THINK_TAGS true and false)
+                                    if delta_content:
+                                        # Clean up edit_content format if present
+                                        if edit_content and not delta_content:
+                                            # Use edit_content, but extract only the answer part
+                                            transformed_delta = self.extract_answer_from_edit_content(edit_content)
+                                        else:
+                                            transformed_delta = delta_content
 
-                                    # Yield immediately for real-time streaming
-                                    yield f"data: {json.dumps(openai_chunk)}\n\n"
+                                        if transformed_delta:
+                                            openai_chunk = {
+                                                "id": completion_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": request.model,
+                                                "choices": [{
+                                                    "index": 0,
+                                                    "delta": {
+                                                        "content": transformed_delta
+                                                    },
+                                                    "finish_reason": None
+                                                }]
+                                            }
+                                            yield f"data: {json.dumps(openai_chunk)}\n\n"
 
                             except json.JSONDecodeError:
                                 continue  # Skip non-JSON lines
@@ -623,3 +601,12 @@ class ProxyHandler:
             logger.error(f"Streaming request error: {e}")
             await cookie_manager.mark_cookie_failed(cookie)
             raise HTTPException(status_code=503, detail=f"Upstream service unavailable: {str(e)}")
+
+    def extract_answer_from_edit_content(self, edit_content: str) -> str:
+        """Extract only the answer part from edit_content when SHOW_THINK_TAGS=false"""
+        if not edit_content:
+            return ""
+        
+        # Remove thinking content (details blocks)
+        content = re.sub(r"<details[^>]*>.*?</details>", "", edit_content, flags=re.DOTALL)
+        return content.strip()
