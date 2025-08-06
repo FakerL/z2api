@@ -52,6 +52,21 @@ class ProxyHandler:
                 text = re.sub(r"</think>(?!</think>)(?![^<]*</think>)$", "", text, count=1)
         return text
 
+    def _clean_thinking_content(self, content: str) -> str:
+        """Clean thinking content by removing HTML tags but preserving the actual thinking text"""
+        if not content:
+            return content
+            
+        # Remove <details> and related tags
+        content = re.sub(r'<details[^>]*>', '', content)
+        content = re.sub(r'</details>', '', content)
+        content = re.sub(r'<summary[^>]*>.*?</summary>', '', content, flags=re.DOTALL)
+        
+        # Clean up any remaining HTML-like tags that might interfere
+        content = re.sub(r'<[^>]+>', '', content)
+        
+        return content.strip()
+
     def transform_content(self, content: str) -> str:
         """Transform upstream HTML to <think> format"""
         if not content:
@@ -277,11 +292,15 @@ class ProxyHandler:
                                         yield f"data: {json.dumps(think_chunk)}\n\n"
                                         think_open = True
 
-                                # Transform content (but don't add extra <think> tags)
-                                if phase == "thinking" and settings.SHOW_THINK_TAGS:
-                                    # Don't transform thinking content to avoid duplicate tags
-                                    transformed_content = delta_content
+                                # Transform content based on phase
+                                if phase == "thinking":
+                                    if settings.SHOW_THINK_TAGS:
+                                        # Clean thinking content but don't add <think> tags (already added above)
+                                        transformed_content = self._clean_thinking_content(delta_content)
+                                    else:
+                                        continue  # Skip if not showing think tags
                                 else:
+                                    # For answer phase, apply normal transformation
                                     transformed_content = self.transform_content(delta_content)
                                 
                                 if transformed_content:  # Only yield if there's content
@@ -394,25 +413,16 @@ class ProxyHandler:
             final_text = ""
             
             if settings.SHOW_THINK_TAGS and thinking_buf:
-                # Don't add extra <think> tags, the content transformation will handle it
-                thinking_text = "".join(thinking_buf)
-                answer_text = "".join(answer_buf)
+                # Clean thinking content and manually add think tags
+                thinking_text = self._clean_thinking_content("".join(thinking_buf))
+                answer_text = self.transform_content("".join(answer_buf)) if answer_buf else ""
                 
-                # Manually add think tags without duplication
-                final_text = f"<think>{thinking_text}</think>{answer_text}"
-            else:
-                final_text = "".join(answer_buf)
-
-            # Apply content transformation but avoid duplicate processing for thinking content
-            if not (settings.SHOW_THINK_TAGS and thinking_buf):
-                final_text = self.transform_content(final_text)
-            else:
-                # Only transform the answer part to avoid duplicating think tags
-                if answer_buf:
-                    answer_part = self.transform_content("".join(answer_buf))
-                    final_text = f"<think>{''.join(thinking_buf)}</think>{answer_part}"
+                if thinking_text:  # Only add think tags if there's actual thinking content
+                    final_text = f"<think>{thinking_text}</think>{answer_text}"
                 else:
-                    final_text = f"<think>{''.join(thinking_buf)}</think>"
+                    final_text = answer_text
+            else:
+                final_text = self.transform_content("".join(answer_buf))
 
             return ChatCompletionResponse(
                 id=f"chatcmpl-{uuid.uuid4().hex[:29]}",
