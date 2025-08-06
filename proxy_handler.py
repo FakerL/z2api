@@ -74,6 +74,18 @@ class ProxyHandler:
 
         return content.strip()
     
+    def transform_delta_content(self, content: str) -> str:
+        """Transform delta content for streaming (simpler version for chunk processing)"""
+        if not content:
+            return content
+            
+        # Convert <details> to <think> and remove summary tags
+        content = re.sub(r'<details[^>]*>', '<think>', content)
+        content = content.replace('</details>', '</think>')
+        content = re.sub(r'<summary>.*?</summary>', '', content, flags=re.DOTALL)
+        
+        return content
+    
     async def proxy_request(self, request: ChatCompletionRequest) -> Dict[str, Any]:
         """Proxy request to Z.AI API"""
         cookie = await cookie_manager.get_next_cookie()
@@ -128,8 +140,6 @@ class ProxyHandler:
             }
         }
 
-
-
         logger.debug(f"Sending request data: {request_data}")
         
         headers = {
@@ -167,40 +177,28 @@ class ProxyHandler:
             logger.error(f"Request error: {e}")
             await cookie_manager.mark_cookie_failed(cookie)
             raise HTTPException(status_code=503, detail="Upstream service unavailable")
-
-    async def process_streaming_response(self, response: httpx.Response) -> AsyncGenerator[Dict[str, Any], None]:
-        """Process streaming response from Z.AI with minimal buffering"""
+    
+    async def process_and_collect_chunks(self, response: httpx.Response) -> list:
+        """Collect and process all chunks similar to Deno version"""
+        chunks = []
         buffer = ""
-        chunk_count = 0
         
-        logger.info("Starting to process streaming response")
-        
-        # Use smaller chunk size for more real-time processing
-        async for chunk in response.aiter_bytes(chunk_size=1024):  # Smaller chunks
-            chunk_count += 1
-            try:
-                text_chunk = chunk.decode('utf-8')
-            except UnicodeDecodeError:
-                continue
-                
-            buffer += text_chunk
+        async for chunk in response.aiter_text():
+            buffer += chunk
+            lines = buffer.split('\n')
+            buffer = lines[-1]  # Keep incomplete line in buffer
             
-            # Process complete lines immediately
-            while '\n' in buffer:
-                line, buffer = buffer.split('\n', 1)
+            for line in lines[:-1]:
                 line = line.strip()
-                
                 if not line.startswith("data: "):
                     continue
                 
                 payload = line[6:].strip()
                 if payload == "[DONE]":
-                    logger.info("Received [DONE] signal")
-                    return
+                    return chunks
                 
                 try:
                     parsed = json.loads(payload)
-                    logger.debug(f"Parsed chunk {chunk_count}: {parsed.get('data', {}).get('phase', 'no-phase')}")
 
                     # Check for errors first
                     if parsed.get("error") or (parsed.get("data", {}).get("error")):
@@ -210,16 +208,24 @@ class ProxyHandler:
                         logger.error(f"Upstream error: {error_detail}")
                         raise HTTPException(status_code=400, detail=f"Upstream error: {error_detail}")
 
-                    # Transform the response
+                    # Transform the response similar to Deno version
                     if parsed.get("data"):
+                        # Remove unwanted fields
                         parsed["data"].pop("edit_index", None)
                         parsed["data"].pop("edit_content", None)
 
-                    yield parsed
+                        # Transform delta_content
+                        delta_content = parsed["data"].get("delta_content", "")
+                        if delta_content:
+                            transformed = self.transform_delta_content(delta_content)
+                            parsed["data"]["delta_content"] = transformed.lstrip()
 
-                except json.JSONDecodeError as e:
-                    logger.debug(f"JSON decode error for line: {line[:100]}...")
+                    chunks.append(parsed)
+
+                except json.JSONDecodeError:
                     continue  # Skip non-JSON lines
+        
+        return chunks
     
     async def handle_chat_completion(self, request: ChatCompletionRequest):
         """Handle chat completion request"""
@@ -232,79 +238,44 @@ class ProxyHandler:
         if is_streaming:
             return StreamingResponse(
                 self.stream_response(response, request.model),
-        media_type="text/plain",
-        headers={
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
-            "Connection": "keep-alive",
-            "Content-Type": "text/plain; charset=utf-8",
-            "X-Accel-Buffering": "no",  # 禁用 nginx 緩沖
-            "Transfer-Encoding": "chunked"
-        }
-    )
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                }
+            )
         else:
-            # For non-streaming responses, SHOW_THINK_TAGS setting applies
             return await self.non_stream_response(response, request.model)
 
     async def stream_response(self, response: httpx.Response, model: str) -> AsyncGenerator[str, None]:
-        """Generate streaming response in OpenAI format with real-time output"""
+        """Generate streaming response in OpenAI format - collect chunks first then stream"""
         import uuid
         import time
         
         # Generate a unique completion ID
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         
-        # Track content and phases
-        total_content = ""
-        current_phase = None
-        chunk_count = 0
-        
-        logger.info(f"Starting streaming response, SHOW_THINK_TAGS: {settings.SHOW_THINK_TAGS}")
-        
         try:
-            async for parsed in self.process_streaming_response(response):
+            # Collect all chunks first (similar to Deno approach)
+            chunks = await self.process_and_collect_chunks(response)
+            
+            if not chunks:
+                raise HTTPException(status_code=500, detail="No response from upstream")
+            
+            # Stream back the transformed chunks
+            for parsed in chunks:
                 try:
-                    chunk_count += 1
                     data = parsed.get("data", {})
                     delta_content = data.get("delta_content", "")
-                    phase = data.get("phase", "")
                     
-                    # Log chunk details for debugging
-                    logger.debug(f"Chunk {chunk_count}: phase={phase}, content_length={len(delta_content)}")
+                    # For SHOW_THINK_TAGS=false, filter out thinking content
+                    if not settings.SHOW_THINK_TAGS:
+                        phase = data.get("phase", "")
+                        if phase != "answer" and delta_content:
+                            continue  # Skip non-answer content
                     
-                    # Track phase changes
-                    if phase != current_phase:
-                        current_phase = phase
-                        logger.info(f"Phase changed to: {phase}")
-                    
-                    # Always accumulate content for debugging
-                    total_content += delta_content
-                    
-                    # Determine if we should send this chunk
-                    should_send = False
-                    transformed_delta = ""
-                    
-                    if delta_content:
-                        if settings.SHOW_THINK_TAGS:
-                            # Show all content, convert <details> to <think>
-                            transformed_delta = delta_content
-                            transformed_delta = re.sub(r'<details[^>]*>', '<think>', transformed_delta)
-                            transformed_delta = transformed_delta.replace('</details>', '</think>')
-                            transformed_delta = re.sub(r'<summary>.*?</summary>', '', transformed_delta, flags=re.DOTALL)
-                            should_send = True
-                            logger.debug(f"Sending chunk with think tags: {len(transformed_delta)} chars")
-                        else:
-                            # Only send answer phase content, but be more permissive
-                            if phase == "answer" or not phase:  # Include empty phase as potential answer
-                                transformed_delta = delta_content
-                                should_send = True
-                                logger.debug(f"Sending answer phase chunk: {len(transformed_delta)} chars")
-                            else:
-                                logger.debug(f"Skipping {phase} phase chunk")
-                    
-                    # Send chunk if we have content
-                    if should_send and transformed_delta:
+                    # Create OpenAI-compatible streaming chunk
+                    if delta_content:  # Only send chunks with content
                         openai_chunk = {
                             "id": completion_id,
                             "object": "chat.completion.chunk",
@@ -313,36 +284,17 @@ class ProxyHandler:
                             "choices": [{
                                 "index": 0,
                                 "delta": {
-                                    "content": transformed_delta
+                                    "content": delta_content
                                 },
                                 "finish_reason": None
                             }]
                         }
                         
-                        chunk_data = f"data: {json.dumps(openai_chunk)}\n\n"
-                        logger.debug(f"Yielding chunk: {len(chunk_data)} bytes")
-                        yield chunk_data
-                    
-                    # Force a small heartbeat chunk occasionally to keep connection alive
-                    elif chunk_count % 10 == 0:  # Every 10 chunks, send a heartbeat
-                        heartbeat_chunk = {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": int(time.time()),
-                            "model": model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": None
-                            }]
-                        }
-                        yield f"data: {json.dumps(heartbeat_chunk)}\n\n"
-                    
+                        yield f"data: {json.dumps(openai_chunk)}\n\n"
+                
                 except Exception as e:
-                    logger.error(f"Error processing streaming chunk {chunk_count}: {e}")
+                    logger.error(f"Error processing streaming chunk: {e}")
                     continue
-            
-            logger.info(f"Streaming completed. Total chunks: {chunk_count}, Total content: {len(total_content)} chars")
             
             # Send final completion chunk
             final_chunk = {
@@ -362,6 +314,7 @@ class ProxyHandler:
             
         except Exception as e:
             logger.error(f"Streaming error: {e}")
+            # Send error in OpenAI format
             error_chunk = {
                 "error": {
                     "message": str(e),
@@ -372,16 +325,13 @@ class ProxyHandler:
     
     async def non_stream_response(self, response: httpx.Response, model: str) -> ChatCompletionResponse:
         """Generate non-streaming response"""
-        chunks = []
-        async for parsed in self.process_streaming_response(response):
-            chunks.append(parsed)
-            logger.debug(f"Received chunk: {parsed}")  # Debug log
+        # Collect all chunks
+        chunks = await self.process_and_collect_chunks(response)
 
         if not chunks:
             raise HTTPException(status_code=500, detail="No response from upstream")
 
         logger.info(f"Total chunks received: {len(chunks)}")
-        logger.debug(f"First chunk structure: {chunks[0] if chunks else 'None'}")
 
         # Aggregate content based on SHOW_THINK_TAGS setting
         if settings.SHOW_THINK_TAGS:
@@ -398,13 +348,11 @@ class ProxyHandler:
             )
 
         logger.info(f"Aggregated content length: {len(full_content)}")
-        logger.debug(f"Full aggregated content: {full_content}")  # Show full content for debugging
 
-        # Apply content transformation (including think tag filtering)
+        # Apply final content transformation (for non-streaming, we can do more complex transformations)
         transformed_content = self.transform_content(full_content)
 
         logger.info(f"Transformed content length: {len(transformed_content)}")
-        logger.debug(f"Transformed content: {transformed_content[:200]}...")
 
         # Create OpenAI-compatible response
         return ChatCompletionResponse(
