@@ -79,138 +79,153 @@ class ProxyHandler:
         return content
     
     async def proxy_request(self, request: ChatCompletionRequest) -> Dict[str, Any]:
-        """Proxy request to Z.AI API"""
-        cookie = await cookie_manager.get_next_cookie()
-        if not cookie:
-            raise HTTPException(status_code=503, detail="No available cookies")
-        
-        # Transform model name
-        target_model = settings.UPSTREAM_MODEL if request.model == settings.MODEL_NAME else request.model
-        
-        # Build request data based on the actual Z.AI API format you provided
-        import uuid
-        from datetime import datetime
+    """Proxy request to Z.AI API"""
+    cookie = await cookie_manager.get_next_cookie()
+    if not cookie:
+        raise HTTPException(status_code=503, detail="No available cookies")
+    
+    # Transform model name
+    target_model = settings.UPSTREAM_MODEL if request.model == settings.MODEL_NAME else request.model
+    
+    # Build request data based on the actual Z.AI API format
+    import uuid
+    from datetime import datetime
 
-        current_time = datetime.now()
-        
-        request_data = {
-            "stream": True,  # Always request streaming from Z.AI
-            "model": target_model,
-            "messages": request.model_dump()["messages"],
-            "params": {},
-            "tool_servers": [],
-            "features": {
-                "image_generation": False,
-                "code_interpreter": False,
-                "web_search": False,
-                "auto_web_search": False,
-                "preview_mode": True,
-                "flags": [],
-                "features": [
-                    {"type": "mcp", "server": "vibe-coding", "status": "hidden"},
-                    {"type": "mcp", "server": "ppt-maker", "status": "hidden"},
-                    {"type": "mcp", "server": "image-search", "status": "hidden"}
-                ],
-                "enable_thinking": True
-            },
-            "variables": {
-                "{{USER_NAME}}": "User",
-                "{{USER_LOCATION}}": "Unknown",
-                "{{CURRENT_DATETIME}}": current_time.strftime("%Y-%m-%d %H:%M:%S"),
-                "{{CURRENT_DATE}}": current_time.strftime("%Y-%m-%d"),
-                "{{CURRENT_TIME}}": current_time.strftime("%H:%M:%S"),
-                "{{CURRENT_WEEKDAY}}": current_time.strftime("%A"),
-                "{{CURRENT_TIMEZONE}}": "Asia/Taipei",
-                "{{USER_LANGUAGE}}": "zh-CN"
-            },
-            "model_item": {
+    current_time = datetime.now()
+    
+    # Generate unique IDs for the request
+    chat_id = str(uuid.uuid4())
+    request_id = str(uuid.uuid4())
+    
+    # Transform messages to include message_id
+    messages_with_ids = []
+    for msg in request.model_dump()["messages"]:
+        message_with_id = {
+            **msg,
+            "message_id": str(uuid.uuid4())  # Add message_id to each message
+        }
+        messages_with_ids.append(message_with_id)
+    
+    request_data = {
+        "stream": True,
+        "model": target_model,
+        "messages": messages_with_ids,  # Use messages with IDs
+        "chat_id": chat_id,  # Add chat_id
+        "id": request_id,    # Add request ID
+        "params": {},
+        "tool_servers": [],
+        "features": {
+            "image_generation": False,
+            "code_interpreter": False,
+            "web_search": False,
+            "auto_web_search": False,
+            "preview_mode": True,
+            "flags": [],
+            "features": [
+                {"type": "mcp", "server": "vibe-coding", "status": "hidden"},
+                {"type": "mcp", "server": "ppt-maker", "status": "hidden"},
+                {"type": "mcp", "server": "image-search", "status": "hidden"}
+            ],
+            "enable_thinking": True
+        },
+        "variables": {
+            "{{USER_NAME}}": "User",
+            "{{USER_LOCATION}}": "Unknown",
+            "{{CURRENT_DATETIME}}": current_time.strftime("%Y-%m-%d %H:%M:%S"),
+            "{{CURRENT_DATE}}": current_time.strftime("%Y-%m-%d"),
+            "{{CURRENT_TIME}}": current_time.strftime("%H:%M:%S"),
+            "{{CURRENT_WEEKDAY}}": current_time.strftime("%A"),
+            "{{CURRENT_TIMEZONE}}": "Asia/Taipei",
+            "{{USER_LANGUAGE}}": "zh-CN"
+        },
+        "model_item": {
+            "id": target_model,
+            "name": "GLM-4.5",
+            "owned_by": "openai",
+            "openai": {
                 "id": target_model,
-                "name": "GLM-4.5",
+                "name": target_model,
                 "owned_by": "openai",
-                "openai": {
-                    "id": target_model,
-                    "name": target_model,
-                    "owned_by": "openai",
-                    "openai": {"id": target_model},
-                    "urlIdx": 1
+                "openai": {"id": target_model},
+                "urlIdx": 1
+            },
+            "urlIdx": 1,
+            "info": {
+                "id": target_model,
+                "user_id": "7080a6c5-5fcc-4ea4-a85f-3b3fac905cf2",
+                "base_model_id": None,
+                "name": "GLM-4.5",
+                "params": {
+                    "top_p": 0.95,
+                    "temperature": 0.6,
+                    "max_tokens": 80000
                 },
-                "urlIdx": 1,
-                "info": {
-                    "id": target_model,
-                    "user_id": "7080a6c5-5fcc-4ea4-a85f-3b3fac905cf2",
-                    "base_model_id": None,
-                    "name": "GLM-4.5",
-                    "params": {
-                        "top_p": 0.95,
-                        "temperature": 0.6,
-                        "max_tokens": 80000
+                "meta": {
+                    "profile_image_url": "/static/favicon.png",
+                    "description": "Most advanced model, proficient in coding and tool use",
+                    "capabilities": {
+                        "vision": False,
+                        "citations": False,
+                        "preview_mode": False,
+                        "web_search": False,
+                        "language_detection": False,
+                        "restore_n_source": False,
+                        "mcp": True,
+                        "file_qa": True,
+                        "returnFc": True,
+                        "returnThink": True,
+                        "think": True
                     },
-                    "meta": {
-                        "profile_image_url": "/static/favicon.png",
-                        "description": "Most advanced model, proficient in coding and tool use",
-                        "capabilities": {
-                            "vision": False,
-                            "citations": False,
-                            "preview_mode": False,
-                            "web_search": False,
-                            "language_detection": False,
-                            "restore_n_source": False,
-                            "mcp": True,
-                            "file_qa": True,
-                            "returnFc": True,
-                            "returnThink": True,
-                            "think": True
-                        },
-                        "mcpServerIds": ["deep-web-search", "ppt-maker", "image-search", "vibe-coding"]
-                    }
+                    "mcpServerIds": ["deep-web-search", "ppt-maker", "image-search", "vibe-coding"]
                 }
             }
         }
+    }
 
-        logger.debug(f"Sending request data: {json.dumps(request_data, indent=2)}")
+    logger.debug(f"Sending request data: {json.dumps(request_data, indent=2)}")
+    
+    # Use the exact headers from your curl request
+    headers = {
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN",
+        "Authorization": f"Bearer {cookie}",
+        "Connection": "keep-alive",
+        "Content-Type": "application/json",
+        "Cookie": f"token={cookie}",
+        "Origin": "https://chat.z.ai",
+        "Referer": "https://chat.z.ai/",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
+        "X-FE-Version": "prod-fe-1.0.57",
+        "sec-ch-ua": '"Chromium";v="137", "Not/A)Brand";v="24"',
+        "sec-ch-ua-mobile": "?1",
+        "sec-ch-ua-platform": '"Android"'
+    }
+    
+    try:
+        response = await self.client.post(
+            settings.UPSTREAM_URL,
+            json=request_data,
+            headers=headers
+        )
         
-        # Use the exact headers from your curl request
-        headers = {
-            "Accept": "*/*",
-            "Accept-Language": "zh-CN",
-            "Authorization": f"Bearer {cookie}",
-            "Connection": "keep-alive",
-            "Content-Type": "application/json",
-            "Cookie": f"token={cookie}",
-            "Origin": "https://chat.z.ai",
-            "Referer": "https://chat.z.ai/",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-            "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36",
-            "X-FE-Version": "prod-fe-1.0.57",
-            "sec-ch-ua": '"Chromium";v="137", "Not/A)Brand";v="24"',
-            "sec-ch-ua-mobile": "?1",
-            "sec-ch-ua-platform": '"Android"'
-        }
-        
-        try:
-            response = await self.client.post(
-                settings.UPSTREAM_URL,
-                json=request_data,
-                headers=headers
-            )
-            
-            if response.status_code == 401:
-                await cookie_manager.mark_cookie_failed(cookie)
-                raise HTTPException(status_code=401, detail="Invalid authentication")
-            
-            if response.status_code != 200:
-                logger.error(f"Upstream error: {response.status_code} - {response.text}")
-                raise HTTPException(status_code=response.status_code, detail=f"Upstream error: {response.text}")
-            
-            await cookie_manager.mark_cookie_success(cookie)
-            return {"response": response, "cookie": cookie}
-            
-        except httpx.RequestError as e:
-            logger.error(f"Request error: {e}")
+        if response.status_code == 401:
             await cookie_manager.mark_cookie_failed(cookie)
-            raise HTTPException(status_code=503, detail="Upstream service unavailable")
+            raise HTTPException(status_code=401, detail="Invalid authentication")
+        
+        if response.status_code != 200:
+            logger.error(f"Upstream error: {response.status_code} - {response.text}")
+            raise HTTPException(status_code=response.status_code, detail=f"Upstream error: {response.text}")
+        
+        await cookie_manager.mark_cookie_success(cookie)
+        return {"response": response, "cookie": cookie}
+        
+    except httpx.RequestError as e:
+        logger.error(f"Request error: {e}")
+        await cookie_manager.mark_cookie_failed(cookie)
+        raise HTTPException(status_code=503, detail="Upstream service unavailable")
     
     async def process_streaming_response_real_time(self, response: httpx.Response) -> AsyncGenerator[Dict[str, Any], None]:
         """Process streaming response in real time - truly streaming"""
