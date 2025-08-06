@@ -39,6 +39,8 @@ class ProxyHandler:
             return content
 
         logger.debug(f"SHOW_THINK_TAGS setting: {settings.SHOW_THINK_TAGS}")
+        logger.debug(f"Original content length: {len(content)}")
+        logger.debug(f"Original content preview: {content[:200]}...")
 
         # Optionally remove thinking content based on configuration
         if not settings.SHOW_THINK_TAGS:
@@ -90,6 +92,8 @@ class ProxyHandler:
                     else:
                         content += "</think>"
 
+        logger.debug(f"Final transformed content length: {len(content)}")
+        logger.debug(f"Final transformed content preview: {content[:200]}...")
         return content.strip()
 
     async def proxy_request(self, request: ChatCompletionRequest) -> Dict[str, Any]:
@@ -110,13 +114,8 @@ class ProxyHandler:
             request.stream if request.stream is not None else settings.DEFAULT_STREAM
         )
 
-        # Validate parameter compatibility
-        if is_streaming and not settings.SHOW_THINK_TAGS:
-            logger.warning("SHOW_THINK_TAGS=false is ignored for streaming responses")
-
         # Prepare request data
         request_data = request.model_dump(exclude_none=True)
-        request_data["model"] = target_model
 
         # Build request data based on actual Z.AI format from zai-messages.md
         request_data = {
@@ -209,6 +208,7 @@ class ProxyHandler:
 
                 try:
                     parsed = json.loads(payload)
+                    logger.debug(f"Parsed chunk: {parsed}")
 
                     # Check for errors first
                     if parsed.get("error") or (parsed.get("data", {}).get("error")):
@@ -228,12 +228,10 @@ class ProxyHandler:
                         parsed["data"].pop("edit_index", None)
                         parsed["data"].pop("edit_content", None)
 
-                        # Note: We don't transform delta_content here because <think> tags
-                        # might span multiple chunks. We'll transform the final aggregated content.
-
                     yield parsed
 
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as e:
+                    logger.debug(f"Failed to parse JSON: {line}, error: {e}")
                     continue  # Skip non-JSON lines
 
     async def stream_response(
@@ -241,22 +239,40 @@ class ProxyHandler:
     ) -> AsyncGenerator[str, None]:
         """Generate OpenAI-compatible streaming response"""
         try:
+            chunk_id = f"chatcmpl-{uuid.uuid4()}"
+            
             async for parsed in self.process_streaming_response(response):
                 # 取得增量內容
                 delta_content = parsed.get("data", {}).get("delta_content", "")
+                phase = parsed.get("data", {}).get("phase", "")
                 
-                # 根據設定決定是否過濾思考內容
+                logger.debug(f"Processing chunk - phase: {phase}, content: {delta_content[:50]}...")
+                
+                # 如果沒有內容就跳過
+                if not delta_content:
+                    continue
+                
+                # 根據 SHOW_THINK_TAGS 設定決定是否輸出
+                should_output = True
+                
                 if not settings.SHOW_THINK_TAGS:
-                    # 只在回答階段輸出內容
-                    phase = parsed.get("data", {}).get("phase", "")
+                    # 如果不顯示思考標籤，只輸出答案階段的內容
                     if phase != "answer":
-                        continue
+                        logger.debug(f"Skipping non-answer phase: {phase}")
+                        should_output = False
+                else:
+                    # 如果顯示思考標籤，對思考內容進行轉換
+                    if phase == "thinking":
+                        # 將 <details> 轉換為 <think>
+                        delta_content = delta_content.replace("<details", "<think")
+                        delta_content = delta_content.replace("</details>", "</think>")
+                        # 移除 <summary> 標籤
+                        delta_content = re.sub(r"<summary>.*?</summary>", "", delta_content, flags=re.DOTALL)
                 
-                # 如果有內容才輸出
-                if delta_content:
+                if should_output and delta_content:
                     # 建立 OpenAI 格式的 chunk
                     chunk = {
-                        "id": parsed.get("data", {}).get("id", f"chatcmpl-{uuid.uuid4()}"),
+                        "id": chunk_id,
                         "object": "chat.completion.chunk",
                         "created": int(time.time()),
                         "model": model,
@@ -269,11 +285,13 @@ class ProxyHandler:
                         ],
                     }
                     
-                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    chunk_json = json.dumps(chunk, ensure_ascii=False)
+                    logger.debug(f"Yielding chunk: {chunk_json}")
+                    yield f"data: {chunk_json}\n\n"
             
             # 發送完成標記
             final_chunk = {
-                "id": f"chatcmpl-{uuid.uuid4()}",
+                "id": chunk_id,
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
                 "model": model,
@@ -309,6 +327,8 @@ class ProxyHandler:
 
     async def handle_chat_completion(self, request: ChatCompletionRequest):
         """Handle chat completion request"""
+        logger.info(f"Handling chat completion request - stream: {request.stream}, SHOW_THINK_TAGS: {settings.SHOW_THINK_TAGS}")
+        
         proxy_result = await self.proxy_request(request)
         response = proxy_result["response"]
 
@@ -317,8 +337,10 @@ class ProxyHandler:
             request.stream if request.stream is not None else settings.DEFAULT_STREAM
         )
 
+        logger.info(f"Final streaming mode: {is_streaming}")
+
         if is_streaming:
-            # For streaming responses, SHOW_THINK_TAGS setting is ignored
+            # For streaming responses
             return StreamingResponse(
                 self.stream_response(response, request.model),
                 media_type="text/event-stream",
@@ -339,7 +361,7 @@ class ProxyHandler:
         chunks = []
         async for parsed in self.process_streaming_response(response):
             chunks.append(parsed)
-            logger.debug(f"Received chunk: {parsed}")  # Debug log
+            logger.debug(f"Received chunk: {parsed}")
 
         if not chunks:
             raise HTTPException(status_code=500, detail="No response from upstream")
@@ -348,29 +370,28 @@ class ProxyHandler:
         logger.debug(f"First chunk structure: {chunks[0] if chunks else 'None'}")
 
         # Aggregate content based on SHOW_THINK_TAGS setting
-        if settings.SHOW_THINK_TAGS:
-            # Include all content
-            full_content = "".join(
-                chunk.get("data", {}).get("delta_content", "") for chunk in chunks
-            )
-        else:
-            # Only include answer phase content
-            full_content = "".join(
-                chunk.get("data", {}).get("delta_content", "")
-                for chunk in chunks
-                if chunk.get("data", {}).get("phase") == "answer"
-            )
+        full_content = ""
+        
+        for chunk in chunks:
+            delta_content = chunk.get("data", {}).get("delta_content", "")
+            phase = chunk.get("data", {}).get("phase", "")
+            
+            if settings.SHOW_THINK_TAGS:
+                # Include all content
+                full_content += delta_content
+            else:
+                # Only include answer phase content
+                if phase == "answer":
+                    full_content += delta_content
 
         logger.info(f"Aggregated content length: {len(full_content)}")
-        logger.debug(
-            f"Full aggregated content: {full_content}"
-        )  # Show full content for debugging
+        logger.debug(f"Full aggregated content preview: {full_content[:200]}...")
 
         # Apply content transformation (including think tag filtering)
         transformed_content = self.transform_content(full_content)
 
         logger.info(f"Transformed content length: {len(transformed_content)}")
-        logger.debug(f"Transformed content: {transformed_content[:200]}...")
+        logger.debug(f"Transformed content preview: {transformed_content[:200]}...")
 
         # Create OpenAI-compatible response
         return ChatCompletionResponse(
