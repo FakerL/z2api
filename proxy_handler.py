@@ -70,20 +70,11 @@ class ProxyHandler:
             content = content.replace("</details>", "</think>")  
             # Remove <summary> tags and their content  
             content = re.sub(r"<summary>.*?</summary>", "", content, flags=re.DOTALL)  
-            # If there's no closing </think>, add it at the end of thinking content  
-            if "<think>" in content and "</think>" not in content:  
-                # Find where thinking ends and answer begins  
-                think_start = content.find("<think>")  
-                if think_start != -1:  
-                    # Look for the start of the actual answer (capital/number/Chinese)  
-                    answer_match = re.search(r"\n\s*[A-Z0-9\u4e00-\u9fff]", content[think_start:])  
-                    if answer_match:  
-                        insert_pos = think_start + answer_match.start()  
-                        content = (  
-                            content[:insert_pos] + "</think>\n" + content[insert_pos:]  
-                        )  
-                    else:  
-                        content += "</think>"  
+            # Auto-close <think> when缺失  
+            open_cnt = content.count("<think>")  
+            close_cnt = content.count("</think>")  
+            if open_cnt > close_cnt:  
+                content += "</think>"  
   
         return content.strip()  
   
@@ -265,7 +256,6 @@ class ProxyHandler:
                 if chunk_data.startswith("data: ") and not chunk_data.startswith("data: [DONE]"):  
                     try:  
                         chunk_json = json.loads(chunk_data[6:])  
-                        # 1. delta_content  
                         if chunk_json.get("choices", [{}])[0].get("delta", {}).get("content"):  
                             chunks.append(chunk_json["choices"][0]["delta"]["content"])  
                     except:  
@@ -298,6 +288,7 @@ class ProxyHandler:
         # Generate a unique completion ID  
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"  
         current_phase = None  
+        role_sent = False  
   
         try:  
             # Real-time streaming: process each chunk immediately as it arrives  
@@ -308,7 +299,6 @@ class ProxyHandler:
                     edit_content = data.get("edit_content", "")  
                     phase = data.get("phase", "")  
   
-                    # Prefer delta_content; if empty use edit_content (重要修正)  
                     content_piece = delta_content if delta_content else edit_content  
   
                     # Track phase changes  
@@ -316,24 +306,41 @@ class ProxyHandler:
                         current_phase = phase  
                         logger.debug(f"Phase changed to: {phase}")  
   
+                    # Send role chunk once at beginning  
+                    if not role_sent:  
+                        role_sent = True  
+                        role_chunk = {  
+                            "id": completion_id,  
+                            "object": "chat.completion.chunk",  
+                            "created": int(time.time()),  
+                            "model": model,  
+                            "choices": [{  
+                                "index": 0,  
+                                "delta": {"role": "assistant"},  
+                                "finish_reason": None  
+                            }]  
+                        }  
+                        yield f"data: {json.dumps(role_chunk)}\n\n"  
+  
                     # Apply filtering based on SHOW_THINK_TAGS and phase  
                     should_send_content = True  
                     if not settings.SHOW_THINK_TAGS and phase == "thinking":  
-                        # Skip thinking content when SHOW_THINK_TAGS=false  
                         should_send_content = False  
-                        logger.debug(f"Skipping thinking content (SHOW_THINK_TAGS=false)")  
   
                     # Process and send content immediately if we should  
                     if content_piece and should_send_content:  
                         transformed_delta = content_piece  
   
                         if settings.SHOW_THINK_TAGS:  
-                            # Simple tag replacement for streaming  
                             transformed_delta = re.sub(r'<details[^>]*>', '<think>', transformed_delta)  
                             transformed_delta = transformed_delta.replace('</details>', '</think>')  
                             transformed_delta = re.sub(r'<summary>.*?</summary>', '', transformed_delta, flags=re.DOTALL)  
   
-                        # Create and send OpenAI-compatible chunk immediately  
+                        # Make sure <think> closed when phase switches  
+                        if settings.SHOW_THINK_TAGS and phase != "thinking" and transformed_delta and not transformed_delta.startswith("</think>"):  
+                            if transformed_delta.lstrip().startswith(">"):  
+                                transformed_delta = "</think>\n" + transformed_delta  
+  
                         openai_chunk = {  
                             "id": completion_id,  
                             "object": "chat.completion.chunk",  
@@ -347,7 +354,6 @@ class ProxyHandler:
                                 "finish_reason": None  
                             }]  
                         }  
-                        # Yield immediately for real-time streaming  
                         yield f"data: {json.dumps(openai_chunk)}\n\n"  
                 except Exception as e:  
                     logger.error(f"Error processing streaming chunk: {e}")  
@@ -369,7 +375,6 @@ class ProxyHandler:
             yield "data: [DONE]\n\n"  
         except Exception as e:  
             logger.error(f"Streaming error: {e}")  
-            # Send error in OpenAI format  
             error_chunk = {  
                 "error": {  
                     "message": str(e),  
@@ -393,35 +398,20 @@ class ProxyHandler:
         logger.info(f"Total chunks received: {len(chunks)}")  
         logger.debug(f"First chunk structure: {chunks[0] if chunks else 'None'}")  
   
-        # Aggregate content based on SHOW_THINK_TAGS setting  
         if settings.SHOW_THINK_TAGS:  
-            # Include all content (delta_content + edit_content)  
             full_content = "".join(  
-                (chunk.get("data", {}).get("delta_content", "")  
-                 or chunk.get("data", {}).get("edit_content", ""))  
-                for chunk in chunks  
+                (c.get("data", {}).get("delta_content", "") or c.get("data", {}).get("edit_content", ""))  
+                for c in chunks  
             )  
         else:  
-            # Only include answer phase content  
             full_content = "".join(  
-                (chunk.get("data", {}).get("delta_content", "")  
-                 or chunk.get("data", {}).get("edit_content", ""))  
-                for chunk in chunks  
-                if chunk.get("data", {}).get("phase") == "answer"  
+                (c.get("data", {}).get("delta_content", "") or c.get("data", {}).get("edit_content", ""))  
+                for c in chunks  
+                if c.get("data", {}).get("phase") == "answer"  
             )  
   
-        logger.info(f"Aggregated content length: {len(full_content)}")  
-        logger.debug(  
-            f"Full aggregated content: {full_content}"  
-        )  # Show full content for debugging  
-  
-        # Apply content transformation (including think tag filtering)  
         transformed_content = self.transform_content(full_content)  
   
-        logger.info(f"Transformed content length: {len(transformed_content)}")  
-        logger.debug(f"Transformed content: {transformed_content[:200]}...")  
-  
-        # Create OpenAI-compatible response  
         return ChatCompletionResponse(  
             id=chunks[0].get("data", {}).get("id", "chatcmpl-unknown"),  
             created=int(time.time()),  
@@ -440,18 +430,15 @@ class ProxyHandler:
         import uuid  
         import time  
   
-        # Get cookie  
         cookie = await cookie_manager.get_next_cookie()  
         if not cookie:  
             raise HTTPException(status_code=503, detail="No valid authentication available")  
   
-        # Prepare request data  
         request_data = request.model_dump(exclude_none=True)  
-        target_model = "0727-360B-API"  # Map GLM-4.5 to Z.AI model  
+        target_model = "0727-360B-API"  
   
-        # Build Z.AI request format  
         request_data = {  
-            "stream": True,  # Always request streaming from Z.AI  
+            "stream": True,  
             "model": target_model,  
             "messages": request_data["messages"],  
             "background_tasks": {  
@@ -497,9 +484,9 @@ class ProxyHandler:
   
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"  
         current_phase = None  
+        role_sent = False  
   
         try:  
-            # Create a new client for this streaming request to avoid conflicts  
             async with httpx.AsyncClient(  
                 timeout=httpx.Timeout(60.0, read=300.0),  
                 limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),  
@@ -521,14 +508,12 @@ class ProxyHandler:
   
                     await cookie_manager.mark_cookie_success(cookie)  
   
-                    # Process streaming response in real-time  
                     buffer = ""  
                     async for chunk in response.aiter_text(chunk_size=1024):  
                         if not chunk:  
                             continue  
   
                         buffer += chunk  
-                        # Process complete lines immediately  
                         while "\n" in buffer:  
                             line, buffer = buffer.split("\n", 1)  
                             line = line.strip()  
@@ -538,7 +523,6 @@ class ProxyHandler:
   
                             payload = line[6:].strip()  
                             if payload == "[DONE]":  
-                                # Send final chunk and done  
                                 final_chunk = {  
                                     "id": completion_id,  
                                     "object": "chat.completion.chunk",  
@@ -563,27 +547,35 @@ class ProxyHandler:
   
                                 content_piece = delta_content if delta_content else edit_content  
   
-                                # Track phase changes  
-                                if phase != current_phase:  
-                                    current_phase = phase  
-                                    logger.debug(f"Phase changed to: {phase}")  
+                                if not role_sent:  
+                                    role_sent = True  
+                                    role_chunk = {  
+                                        "id": completion_id,  
+                                        "object": "chat.completion.chunk",  
+                                        "created": int(time.time()),  
+                                        "model": request.model,  
+                                        "choices": [{  
+                                            "index": 0,  
+                                            "delta": {"role": "assistant"},  
+                                            "finish_reason": None  
+                                        }]  
+                                    }  
+                                    yield f"data: {json.dumps(role_chunk)}\n\n"  
   
-                                # Apply filtering based on SHOW_THINK_TAGS and phase  
                                 should_send_content = True  
                                 if not settings.SHOW_THINK_TAGS and phase == "thinking":  
                                     should_send_content = False  
   
-                                # Process and send content immediately if we should  
                                 if content_piece and should_send_content:  
-                                    # Minimal transformation for real-time streaming  
                                     transformed_delta = content_piece  
                                     if settings.SHOW_THINK_TAGS:  
-                                        # Simple tag replacement for streaming  
                                         transformed_delta = re.sub(r'<details[^>]*>', '<think>', transformed_delta)  
                                         transformed_delta = transformed_delta.replace('</details>', '</think>')  
                                         transformed_delta = re.sub(r'<summary>.*?</summary>', '', transformed_delta, flags=re.DOTALL)  
+                                    if settings.SHOW_THINK_TAGS and phase != "thinking" and transformed_delta and not transformed_delta.startswith("</think>"):  
+                                        if transformed_delta.lstrip().startswith(">") or transformed_delta[0].isalnum():  
+                                            transformed_delta = "</think>\n" + transformed_delta  
   
-                                    # Create and send OpenAI-compatible chunk immediately  
                                     openai_chunk = {  
                                         "id": completion_id,  
                                         "object": "chat.completion.chunk",  
@@ -597,10 +589,9 @@ class ProxyHandler:
                                             "finish_reason": None  
                                         }]  
                                     }  
-                                    # Yield immediately for real-time streaming  
                                     yield f"data: {json.dumps(openai_chunk)}\n\n"  
                             except json.JSONDecodeError:  
-                                continue  # Skip non-JSON lines  
+                                continue  
         except httpx.RequestError as e:  
             logger.error(f"Streaming request error: {e}")  
             await cookie_manager.mark_cookie_failed(cookie)  
