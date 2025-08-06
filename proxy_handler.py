@@ -230,8 +230,8 @@ class ProxyHandler:
         is_streaming = request.stream if request.stream is not None else settings.DEFAULT_STREAM
 
         if is_streaming:
-    return StreamingResponse(
-        self.stream_response(response, request.model),
+            return StreamingResponse(
+                self.stream_response(response, request.model),
         media_type="text/plain",
         headers={
             "Cache-Control": "no-cache, no-store, must-revalidate",
