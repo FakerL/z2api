@@ -65,10 +65,21 @@ class ProxyHandler:
         # Clean up any remaining HTML-like tags that might interfere
         content = re.sub(r'<[^>]+>', '', content)
         
-        # Remove any stray ">" that might appear after cleaning
-        content = re.sub(r'^>\s*', '', content.strip())
+        # Remove any stray ">" that might appear after cleaning, but be more careful
+        content = re.sub(r'^>\s*', '', content)
+        content = re.sub(r'\n>\s*', '\n', content)
         
         return content.strip()
+
+    def _clean_answer_content(self, content: str) -> str:
+        """Clean answer content by only removing <details> blocks but preserving everything else"""
+        if not content:
+            return content
+            
+        # Only remove <details> blocks, preserve all markdown and other content
+        content = re.sub(r"<details[^>]*>.*?</details>", "", content, flags=re.DOTALL)
+        
+        return content
 
     def transform_content(self, content: str) -> str:
         """Transform upstream HTML to <think> format"""
@@ -303,14 +314,8 @@ class ProxyHandler:
                                     else:
                                         continue  # Skip if not showing think tags
                                 else:
-                                    # For answer phase, only remove <details> blocks but keep markdown
-                                    if settings.SHOW_THINK_TAGS:
-                                        # Remove <details> blocks but preserve markdown
-                                        transformed_content = re.sub(r"<details[^>]*>.*?</details>", "", delta_content, flags=re.DOTALL)
-                                    else:
-                                        # Remove <details> blocks but preserve markdown
-                                        transformed_content = re.sub(r"<details[^>]*>.*?</details>", "", delta_content, flags=re.DOTALL)
-                                    transformed_content = transformed_content.strip()
+                                    # For answer phase, use minimal cleaning to preserve markdown
+                                    transformed_content = self._clean_answer_content(delta_content)
                                 
                                 if transformed_content:  # Only yield if there's content
                                     chunk = {
@@ -328,7 +333,6 @@ class ProxyHandler:
 
         except httpx.RequestError as e:
             logger.error(f"Request error: {e}")
-            # Yield error message as streaming response
             error_chunk = {
                 "id": f"chatcmpl-{uuid.uuid4().hex[:29]}",
                 "object": "chat.completion.chunk",
@@ -344,7 +348,6 @@ class ProxyHandler:
             yield "data: [DONE]\n\n"
         except Exception as e:
             logger.error(f"Unexpected error in streaming: {e}")
-            # Yield error message as streaming response
             error_chunk = {
                 "id": f"chatcmpl-{uuid.uuid4().hex[:29]}",
                 "object": "chat.completion.chunk",
@@ -422,22 +425,22 @@ class ProxyHandler:
             final_text = ""
             
             if settings.SHOW_THINK_TAGS and thinking_buf:
-                # Clean thinking content and manually add think tags
+                # Clean thinking content
                 thinking_raw = "".join(thinking_buf)
                 thinking_text = self._clean_thinking_content(thinking_raw)
                 
-                # For answer content, only remove <details> blocks but preserve markdown
+                # Clean answer content minimally
                 answer_raw = "".join(answer_buf) if answer_buf else ""
-                answer_text = re.sub(r"<details[^>]*>.*?</details>", "", answer_raw, flags=re.DOTALL).strip()
+                answer_text = self._clean_answer_content(answer_raw)
                 
-                if thinking_text:  # Only add think tags if there's actual thinking content
+                if thinking_text:
                     final_text = f"<think>{thinking_text}</think>{answer_text}"
                 else:
                     final_text = answer_text
             else:
-                # For non-thinking mode, only remove <details> blocks but preserve markdown
+                # Clean answer content minimally
                 answer_raw = "".join(answer_buf)
-                final_text = re.sub(r"<details[^>]*>.*?</details>", "", answer_raw, flags=re.DOTALL).strip()
+                final_text = self._clean_answer_content(answer_raw)
 
             return ChatCompletionResponse(
                 id=f"chatcmpl-{uuid.uuid4().hex[:29]}",
