@@ -29,24 +29,37 @@ class ProxyHandler:
     
     def _clean_thinking_content(self, text: str) -> str:
         """
-        A robust cleaner for the raw thinking content string.
+        Aggressively cleans raw thinking content strings.
+        Removes tool calls, HTML-like tags, and other metadata.
         """
         if not text:
             return ""
-        # 1. Remove tool call blocks first
+        # Remove tool call blocks first
         cleaned_text = re.sub(r'<glm_block.*?</glm_block>', '', text, flags=re.DOTALL)
-        # 2. Remove all HTML-like tags. This gets rid of <details>, <summary>, etc.
+        # Remove all other HTML-like tags
         cleaned_text = re.sub(r'<[^>]+>', '', cleaned_text)
-        # 3. Remove specific known metadata patterns that are not standard HTML.
+        # Remove specific metadata patterns
         cleaned_text = re.sub(r'true" duration="\d+">\s*Thought for \d+ seconds', '', cleaned_text)
-        # 4. Remove leading markdown quote symbols
+        # Remove leading markdown quote symbols
         cleaned_text = re.sub(r'^\s*>\s*', '', cleaned_text, flags=re.MULTILINE)
-        # 5. Remove any "Thinking..." headers.
+        # Remove "Thinking..." headers
         cleaned_text = cleaned_text.replace("Thinking…", "")
-        # 6. Final strip to clean up any residual whitespace.
+        # Final strip to clean up residual whitespace
+        return cleaned_text.strip()
+
+    def _clean_answer_content(self, text: str) -> str:
+        """
+        Cleans only <glm_block> tags from the final answer content,
+        preserving other potential markdown or HTML formatting.
+        """
+        if not text:
+            return ""
+        # Remove only tool call blocks
+        cleaned_text = re.sub(r'<glm_block.*?</glm_block>', '', text, flags=re.DOTALL)
         return cleaned_text.strip()
 
     def _serialize_msgs(self, msgs) -> list:
+        """Converts message objects to a list of dictionaries."""
         out = []
         for m in msgs:
             if hasattr(m, "dict"): out.append(m.dict())
@@ -56,6 +69,7 @@ class ProxyHandler:
         return out
 
     async def _prep_upstream(self, req: ChatCompletionRequest) -> Tuple[Dict[str, Any], Dict[str, str], str]:
+        """Prepares the request body, headers, and cookie for the upstream API."""
         ck = await cookie_manager.get_next_cookie()
         if not ck: raise HTTPException(503, "No available cookies")
         model = settings.UPSTREAM_MODEL if req.model == settings.MODEL_NAME else req.model
@@ -73,24 +87,28 @@ class ProxyHandler:
                 nonlocal think_open
                 if not text: return
                 
+                # Apply cleaning based on content type
+                cleaned_text = ""
+                if content_type == "thinking":
+                    cleaned_text = self._clean_thinking_content(text)
+                elif content_type == "answer":
+                    cleaned_text = self._clean_answer_content(text)
+
+                if not cleaned_text: return
+
                 if content_type == "thinking" and settings.SHOW_THINK_TAGS:
                     if not think_open:
                         yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': '<think>'}, 'finish_reason': None}]})}\n\n"
                         think_open = True
                     
-                    # --- START OF FINAL FIX ---
-                    # Use the unified cleaning function for streaming content as well.
-                    # This ensures consistent output with non-streaming mode.
-                    cleaned_text = self._clean_thinking_content(text)
-                    # --- END OF FINAL FIX ---
-                    
-                    if cleaned_text:
-                        yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': cleaned_text}, 'finish_reason': None}]})}\n\n"
+                    yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': cleaned_text}, 'finish_reason': None}]})}\n\n"
+                
                 elif content_type == "answer":
                     if think_open:
                         yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': '</think>'}, 'finish_reason': None}]})}\n\n"
                         think_open = False
-                    yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': text}, 'finish_reason': None}]})}\n\n"
+                    
+                    yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': cleaned_text}, 'finish_reason': None}]})}\n\n"
 
             async with self.client.stream("POST", settings.UPSTREAM_URL, json=body, headers=headers) as resp:
                 if resp.status_code != 200:
@@ -103,7 +121,8 @@ class ProxyHandler:
                 async for raw in resp.aiter_text():
                     for line in raw.strip().split('\n'):
                         line = line.strip()
-                        if not line or not line.startswith('data: '): continue
+                        if not line.startswith('data: '): continue
+                        
                         payload_str = line[6:]
                         if payload_str == '[DONE]':
                             if think_open: yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': '</think>'}, 'finish_reason': None}]})}\n\n"
@@ -143,7 +162,8 @@ class ProxyHandler:
                 async for raw in resp.aiter_text():
                     for line in raw.strip().split('\n'):
                         line = line.strip()
-                        if not line or not line.startswith('data: '): continue
+                        if not line.startswith('data: '): continue
+                        
                         payload_str = line[6:]
                         if payload_str == '[DONE]': break
                         try:
@@ -170,12 +190,15 @@ class ProxyHandler:
                     else: continue
                     break
 
-            final_ans_text = ''.join(raw_answer_parts)
-            final_content = final_ans_text
+            # Clean the final answer text, removing only <glm_block> tags.
+            cleaned_ans_text = self._clean_answer_content(''.join(raw_answer_parts))
+            final_content = cleaned_ans_text
+            
             if settings.SHOW_THINK_TAGS and raw_thinking_parts:
+                # Aggressively clean the thinking part.
                 cleaned_think_text = self._clean_thinking_content(''.join(raw_thinking_parts))
                 if cleaned_think_text:
-                    final_content = f"<think>{cleaned_think_text}</think>{final_ans_text}"
+                    final_content = f"<think>{cleaned_think_text}</think>{cleaned_ans_text}"
 
             return ChatCompletionResponse(
                 id=f"chatcmpl-{uuid.uuid4().hex[:29]}", created=int(time.time()), model=req.model,
@@ -185,6 +208,7 @@ class ProxyHandler:
             logger.exception("Non-stream processing failed"); raise
 
     async def handle_chat_completion(self, req: ChatCompletionRequest):
+        """Determines whether to stream or not and handles the request."""
         stream = bool(req.stream) if req.stream is not None else settings.DEFAULT_STREAM
         if stream:
             return StreamingResponse(self.stream_proxy_response(req), media_type="text/event-stream",
