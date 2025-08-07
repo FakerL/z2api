@@ -1,5 +1,6 @@
 """
 Proxy handler for Z.AI API requests
+Updated: 2025-08-06
 """
 
 import json
@@ -51,35 +52,34 @@ class ProxyHandler:
                 text = re.sub(r"</think>(?!</think>)(?![^<]*</think>)$", "", text, count=1)
         return text
 
-    def _minimal_clean_content(self, content: str) -> str:
-        """Minimal content cleaning to preserve all characters"""
+    def _clean_thinking_content(self, content: str) -> str:
+        """Clean thinking content by removing HTML tags but preserving the actual thinking text"""
         if not content:
             return content
+            
+        # Remove <details> and related tags
+        content = re.sub(r'<details[^>]*>', '', content)
+        content = re.sub(r'</details>', '', content)
+        content = re.sub(r'<summary[^>]*>.*?</summary>', '', content, flags=re.DOTALL)
         
-        # Log original content for debugging
-        logger.debug(f"Original content: {repr(content[:100])}")
+        # Clean up any remaining HTML-like tags that might interfere
+        content = re.sub(r'<[^>]+>', '', content)
         
-        # Only remove the most obvious HTML artifacts, nothing else
-        # Remove <details> blocks only
-        cleaned = re.sub(r'<details[^>]*>.*?</details>', '', content, flags=re.DOTALL | re.IGNORECASE)
+        # Remove any stray ">" that might appear after cleaning, but be more careful
+        content = re.sub(r'^>\s*', '', content)
+        content = re.sub(r'\n>\s*', '\n', content)
         
-        # Remove <summary> blocks only
-        cleaned = re.sub(r'<summary[^>]*>.*?</summary>', '', cleaned, flags=re.DOTALL | re.IGNORECASE)
-        
-        # That's it - no other processing to avoid accidentally removing characters
-        
-        # Log cleaned content for debugging
-        logger.debug(f"Cleaned content: {repr(cleaned[:100])}")
-        
-        return cleaned
-
-    def _clean_thinking_content(self, content: str) -> str:
-        """Clean thinking content with minimal processing"""
-        return self._minimal_clean_content(content)
+        return content.strip()
 
     def _clean_answer_content(self, content: str) -> str:
-        """Clean answer content with minimal processing"""
-        return self._minimal_clean_content(content)
+        """Clean answer content by only removing <details> blocks but preserving everything else"""
+        if not content:
+            return content
+            
+        # Only remove <details> blocks, preserve all markdown and other content
+        content = re.sub(r"<details[^>]*>.*?</details>", "", content, flags=re.DOTALL)
+        
+        return content
 
     def transform_content(self, content: str) -> str:
         """Transform upstream HTML to <think> format"""
@@ -88,14 +88,14 @@ class ProxyHandler:
             
         if settings.SHOW_THINK_TAGS:
             # Replace <details> with <think>
-            content = re.sub(r"<details[^>]*>", "<think>", content, flags=re.IGNORECASE)
-            content = re.sub(r"</details>", "</think>", content, flags=re.IGNORECASE)
+            content = re.sub(r"<details[^>]*>", "<think>", content)
+            content = re.sub(r"</details>", "</think>", content)
             # Remove <summary> tags
-            content = re.sub(r"<summary>.*?</summary>", "", content, flags=re.DOTALL | re.IGNORECASE)
+            content = re.sub(r"<summary>.*?</summary>", "", content, flags=re.DOTALL)
             content = self._balance_think_tag(content)
         else:
             # Remove entire <details> blocks
-            content = re.sub(r"<details[^>]*>.*?</details>", "", content, flags=re.DOTALL | re.IGNORECASE)
+            content = re.sub(r"<details[^>]*>.*?</details>", "", content, flags=re.DOTALL)
 
         return content.strip()
 
@@ -177,7 +177,7 @@ class ProxyHandler:
 
     # Main streaming logic
     async def stream_proxy_response(self, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
-        """Handle streaming proxy response with minimal processing"""
+        """Handle streaming proxy response"""
         client = None
         try:
             # Create a new client for this request
@@ -210,26 +210,19 @@ class ProxyHandler:
                     yield "data: [DONE]\n\n"
                     return
 
-                # Accumulate raw text to ensure we don't split events incorrectly
-                raw_buffer = ""
-                
                 async for raw_chunk in response.aiter_text():
-                    if not raw_chunk:
+                    if not raw_chunk or raw_chunk.isspace():
                         continue
 
-                    raw_buffer += raw_chunk
-                    
-                    # Process complete events only
-                    while '\n\n' in raw_buffer:
-                        event_block, raw_buffer = raw_buffer.split('\n\n', 1)
-                        
-                        # Process each line in the event block
-                        for line in event_block.split('\n'):
-                            line = line.strip()
-                            if not line or line.startswith(':') or not line.startswith('data: '):
-                                continue
+                    # Handle Server-Sent Events format
+                    lines = raw_chunk.split('\n')
+                    for line in lines:
+                        line = line.strip()
+                        if not line or line.startswith(':'):
+                            continue
 
-                            payload = line[6:]  # Remove 'data: '
+                        if line.startswith('data: '):
+                            payload = line[6:]
                             
                             if payload == '[DONE]':
                                 # Close thinking tag if still open
@@ -262,11 +255,10 @@ class ProxyHandler:
                                 yield "data: [DONE]\n\n"
                                 return
 
-                            # Parse JSON payload
+                            # Handle normal JSON
                             try:
                                 parsed = json.loads(payload)
-                            except json.JSONDecodeError as e:
-                                logger.warning(f"Failed to parse JSON: {e}, payload: {payload[:100]}")
+                            except json.JSONDecodeError:
                                 continue
 
                             data = parsed.get("data", {})
@@ -292,14 +284,11 @@ class ProxyHandler:
                                     yield f"data: {json.dumps(auto_close)}\n\n"
                                     think_open = False
 
-                            # Process delta content
-                            if delta_content:
-                                logger.debug(f"Raw delta_content ({phase}): {repr(delta_content[:50])}")
-                                
-                                # Skip thinking content if not showing think tags
-                                if phase == "thinking" and not settings.SHOW_THINK_TAGS:
-                                    continue
+                            # Decide whether to output content
+                            if phase == "thinking" and not settings.SHOW_THINK_TAGS:
+                                continue  # Skip thinking content
 
+                            if delta_content:
                                 if phase == "thinking" and settings.SHOW_THINK_TAGS:
                                     # First time entering thinking phase, add <think> tag
                                     if not think_open:
@@ -317,24 +306,18 @@ class ProxyHandler:
                                         yield f"data: {json.dumps(think_chunk)}\n\n"
                                         think_open = True
 
-                                # Apply ABSOLUTE MINIMAL processing
+                                # Transform content based on phase
                                 if phase == "thinking":
-                                    # For thinking: only remove obvious HTML tags, keep everything else
-                                    output_content = delta_content
-                                    # Only remove details/summary tags if they exist
-                                    if '<details' in output_content or '<summary' in output_content:
-                                        output_content = self._clean_thinking_content(output_content)
+                                    if settings.SHOW_THINK_TAGS:
+                                        # Clean thinking content but don't add <think> tags (already added above)
+                                        transformed_content = self._clean_thinking_content(delta_content)
+                                    else:
+                                        continue  # Skip if not showing think tags
                                 else:
-                                    # For answer: even more minimal processing
-                                    output_content = delta_content
-                                    # Only remove details tags if they exist
-                                    if '<details' in output_content:
-                                        output_content = self._clean_answer_content(output_content)
-
-                                # Log the final output for debugging
-                                if output_content:
-                                    logger.debug(f"Output content ({phase}): {repr(output_content[:50])}")
-                                    
+                                    # For answer phase, use minimal cleaning to preserve markdown
+                                    transformed_content = self._clean_answer_content(delta_content)
+                                
+                                if transformed_content:  # Only yield if there's content
                                     chunk = {
                                         "id": completion_id,
                                         "object": "chat.completion.chunk",
@@ -342,7 +325,7 @@ class ProxyHandler:
                                         "model": request.model,
                                         "choices": [{
                                             "index": 0,
-                                            "delta": {"content": output_content},
+                                            "delta": {"content": transformed_content},
                                             "finish_reason": None
                                         }]
                                     }
@@ -383,7 +366,7 @@ class ProxyHandler:
                 await client.aclose()
 
     async def non_stream_proxy_response(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
-        """Handle non-streaming proxy response with minimal processing"""
+        """Handle non-streaming proxy response"""
         client = None
         try:
             # Create a new client for this request
@@ -397,7 +380,6 @@ class ProxyHandler:
             thinking_buf = []
             answer_buf = []
             current_phase = None
-            raw_buffer = ""
 
             async with client.stream("POST", settings.UPSTREAM_URL, json=req_body, headers=headers) as response:
                 if response.status_code != 200:
@@ -405,80 +387,60 @@ class ProxyHandler:
                     raise HTTPException(status_code=response.status_code, detail="Upstream API error")
 
                 async for raw_chunk in response.aiter_text():
-                    if not raw_chunk:
+                    if not raw_chunk or raw_chunk.isspace():
                         continue
 
-                    raw_buffer += raw_chunk
-                    
-                    # Process complete events only
-                    while '\n\n' in raw_buffer:
-                        event_block, raw_buffer = raw_buffer.split('\n\n', 1)
+                    lines = raw_chunk.split('\n')
+                    for line in lines:
+                        line = line.strip()
+                        if not line or line.startswith(':'):
+                            continue
                         
-                        for line in event_block.split('\n'):
-                            line = line.strip()
-                            if not line or line.startswith(':') or not line.startswith('data: '):
-                                continue
+                        if not line.startswith('data: '):
+                            continue
 
-                            payload = line[6:]
-                            if payload == '[DONE]':
-                                break
+                        payload = line[6:]
+                        if payload == '[DONE]':
+                            break
 
-                            try:
-                                parsed = json.loads(payload)
-                            except json.JSONDecodeError:
-                                continue
+                        try:
+                            parsed = json.loads(payload)
+                        except json.JSONDecodeError:
+                            continue
 
-                            data = parsed.get("data", {})
-                            delta_content = data.get("delta_content", "")
-                            phase = data.get("phase")
+                        data = parsed.get("data", {})
+                        delta_content = data.get("delta_content", "")
+                        phase = data.get("phase")
 
-                            if phase != current_phase:
-                                current_phase = phase
+                        if phase != current_phase:
+                            current_phase = phase
 
-                            if delta_content:
-                                logger.debug(f"Non-stream raw delta_content ({phase}): {repr(delta_content[:50])}")
-                                
-                                if phase == "thinking":
-                                    thinking_buf.append(delta_content)
-                                elif phase == "answer":
-                                    answer_buf.append(delta_content)
+                        if delta_content:
+                            if phase == "thinking":
+                                thinking_buf.append(delta_content)
+                            elif phase == "answer":
+                                answer_buf.append(delta_content)
 
-            # Combine content with minimal processing
+            # Combine thinking and answer content
             final_text = ""
             
             if settings.SHOW_THINK_TAGS and thinking_buf:
-                # Join raw thinking content
+                # Clean thinking content
                 thinking_raw = "".join(thinking_buf)
-                logger.debug(f"Raw thinking content: {repr(thinking_raw[:100])}")
+                thinking_text = self._clean_thinking_content(thinking_raw)
                 
-                # Apply minimal cleaning
-                thinking_text = thinking_raw
-                if '<details' in thinking_text or '<summary' in thinking_text:
-                    thinking_text = self._clean_thinking_content(thinking_text)
-                
-                # Join raw answer content
+                # Clean answer content minimally
                 answer_raw = "".join(answer_buf) if answer_buf else ""
-                logger.debug(f"Raw answer content: {repr(answer_raw[:100])}")
-                
-                # Apply minimal cleaning
-                answer_text = answer_raw
-                if '<details' in answer_text:
-                    answer_text = self._clean_answer_content(answer_text)
+                answer_text = self._clean_answer_content(answer_raw)
                 
                 if thinking_text:
                     final_text = f"<think>{thinking_text}</think>{answer_text}"
                 else:
                     final_text = answer_text
             else:
-                # Process answer content only
+                # Clean answer content minimally
                 answer_raw = "".join(answer_buf)
-                logger.debug(f"Raw answer content (no thinking): {repr(answer_raw[:100])}")
-                
-                final_text = answer_raw
-                if '<details' in final_text:
-                    final_text = self._clean_answer_content(final_text)
-
-            logger.debug(f"Final text: {repr(final_text[:100])}")
+                final_text = self._clean_answer_content(answer_raw)
 
             return ChatCompletionResponse(
                 id=f"chatcmpl-{uuid.uuid4().hex[:29]}",
