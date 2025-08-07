@@ -1,3 +1,8 @@
+我看到問題了。在 `</think>` 標籤關閉後，當開始輸出正文時，可能會缺失第一個字符。這個問題出現在流式響應的處理邏輯中。
+
+以下是修正後的完整代碼：
+
+```python
 """
 Proxy handler for Z.AI API requests
 """
@@ -116,7 +121,7 @@ class ProxyHandler:
             )
             body, headers, ck = await self._prep_upstream(req)
             comp_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-            think_open, phase_cur, need_nl = False, None, False
+            think_open, phase_cur, first_answer_chunk = False, None, True
 
             async with client.stream("POST", settings.UPSTREAM_URL, json=body, headers=headers) as resp:
                 if resp.status_code != 200:
@@ -157,19 +162,23 @@ class ProxyHandler:
                         delta, phase = dat.get("delta_content", ""), dat.get("phase")
                         if not delta: continue
 
-                        # phase change
+                        # phase change handling
                         if phase != phase_cur:
                             phase_cur = phase
-                            if phase == "answer" and think_open and settings.SHOW_THINK_TAGS:
-                                auto_close = {
-                                    "id": comp_id, "object": "chat.completion.chunk", "created": int(time.time()),
-                                    "model": req.model,
-                                    "choices": [{"index": 0, "delta": {"content": "</think>"}, "finish_reason": None}],
-                                }
-                                yield f"data: {json.dumps(auto_close)}\n\n"
-                                think_open, need_nl = False, True
+                            if phase == "answer":
+                                if think_open and settings.SHOW_THINK_TAGS:
+                                    # 關閉 think 標籤
+                                    auto_close = {
+                                        "id": comp_id, "object": "chat.completion.chunk", "created": int(time.time()),
+                                        "model": req.model,
+                                        "choices": [{"index": 0, "delta": {"content": "</think>"}, "finish_reason": None}],
+                                    }
+                                    yield f"data: {json.dumps(auto_close)}\n\n"
+                                    think_open = False
+                                first_answer_chunk = True  # 標記第一個answer chunk
 
-                        if phase == "thinking" and not settings.SHOW_THINK_TAGS: continue
+                        if phase == "thinking" and not settings.SHOW_THINK_TAGS: 
+                            continue
 
                         if phase == "thinking":
                             if settings.SHOW_THINK_TAGS and not think_open:
@@ -181,11 +190,12 @@ class ProxyHandler:
                                 yield f"data: {json.dumps(open_c)}\n\n"
                                 think_open = True
                             text = self._clean_thinking(delta)
-                        else:
-                            if need_nl:
-                                delta = "\n" + delta
-                                need_nl = False
+                        else:  # answer phase
                             text = self._clean_answer(delta)
+                            # 如果是第一個answer chunk且顯示think tags，在前面加上換行
+                            if first_answer_chunk and settings.SHOW_THINK_TAGS and text:
+                                text = "\n" + text
+                                first_answer_chunk = False
 
                         if text:
                             out = {
@@ -278,3 +288,17 @@ class ProxyHandler:
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
         return await self.non_stream_proxy_response(req)
+```
+
+**主要修正：**
+
+1. **移除了原有的 `need_nl` 變數和相關邏輯**，這個變數可能導致字符丟失
+2. **新增 `first_answer_chunk` 變數**來追蹤是否為第一個answer階段的內容塊
+3. **改進了階段切換邏輯**：
+   - 當從thinking階段切換到answer階段時，關閉 `</think>` 標籤
+   - 標記 `first_answer_chunk = True`
+4. **修正了換行邏輯**：
+   - 只在第一個answer chunk且顯示think tags時才加換行
+   - 確保不會丟失任何字符
+
+這樣修正後，`</think>` 標籤關閉後的正文首字就不會再缺失了。
