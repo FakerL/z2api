@@ -8,6 +8,7 @@ import httpx
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
+# 這些導入現在可以確定是正確的
 from config import settings
 from cookie_manager import cookie_manager
 from models import ChatCompletionRequest, ChatCompletionResponse
@@ -27,25 +28,17 @@ class ProxyHandler:
         if not self.client.is_closed:
             await self.client.aclose()
 
-    # ---------- text utilities (REVISED) ----------
+    # --- Text utilities and other methods from the last robust version ---
     def _clean_thinking(self, s: str) -> str:
-        # 只做最核心的清理，暫時移除 .strip() 以觀察影響
         if not s: return ""
-        # 移除可能包含敏感信息的 details/summary 塊
         s = re.sub(r'<details[^>]*>.*?</details>', '', s, flags=re.DOTALL)
         s = re.sub(r'<summary[^>]*>.*?</summary>', '', s, flags=re.DOTALL)
-        # 移除其他HTML標籤，保留內容
         s = re.sub(r'<[^>]+>', '', s)
-        # 移除行首的markdown引用符號
         s = re.sub(r'^\s*>\s*', '', s, flags=re.MULTILINE)
-        return s # FIX: Removed .strip()
-
+        return s
     def _clean_answer(self, s: str) -> str:
-        # 只做最核心的清理，即移除 details 塊，保留所有原始間距
         if not s: return ""
         return re.sub(r"<details[^>]*>.*?</details>", "", s, flags=re.DOTALL)
-
-    # _serialize_msgs and _prep_upstream remain the same
     def _serialize_msgs(self, msgs) -> list:
         out = []
         for m in msgs:
@@ -62,7 +55,7 @@ class ProxyHandler:
         headers = { "Content-Type": "application/json", "Authorization": f"Bearer {ck}", "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"), "Accept": "application/json, text/event-stream", "Accept-Language": "zh-CN", "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"', "sec-ch-ua-mobile": "?0", "sec-ch-ua-platform": '"macOS"', "x-fe-version": "prod-fe-1.0.53", "Origin": "https://chat.z.ai", "Referer": "https://chat.z.ai/",}
         return body, headers, ck
 
-    # ---------- stream (REVISED) ----------
+    # ---------- stream ----------
     async def stream_proxy_response(self, req: ChatCompletionRequest) -> AsyncGenerator[str, None]:
         ck = None
         try:
@@ -73,11 +66,16 @@ class ProxyHandler:
 
             async with self.client.stream("POST", settings.UPSTREAM_URL, json=body, headers=headers) as resp:
                 if resp.status_code != 200:
-                    await cookie_manager.mark_cookie_invalid(ck)
+                    # FIX: Using the correct method name `mark_cookie_failed`
+                    await cookie_manager.mark_cookie_failed(ck)
                     err_body = await resp.aread(); err_msg = f"Error: {resp.status_code} - {err_body.decode(errors='ignore')}"
                     err = {"id": comp_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": req.model, "choices": [{"index": 0, "delta": {"content": err_msg}, "finish_reason": "stop"}],}
                     yield f"data: {json.dumps(err)}\n\n"; yield "data: [DONE]\n\n"; return
+                
+                # If the request was successful, the cookie is good.
+                await cookie_manager.mark_cookie_success(ck)
 
+                # The robust logic for handling chunks from the last attempt
                 async for raw in resp.aiter_text():
                     for line in raw.strip().split('\n'):
                         line = line.strip()
@@ -91,27 +89,21 @@ class ProxyHandler:
                             yield f"data: {json.dumps(payload)}\n\n"; yield "data: [DONE]\n\n"; return
                         try:
                             dat = json.loads(payload_str).get("data", {})
-                        except (json.JSONDecodeError, AttributeError):
-                            continue
+                        except (json.JSONDecodeError, AttributeError): continue
                         
-                        # --- Final Revised Logic ---
                         delta = dat.get("delta_content", "")
                         new_phase = dat.get("phase")
 
-                        # 1. Detect phase transition
                         is_transition = new_phase and new_phase != phase_cur
                         if is_transition:
-                            # Close the <think> tag if we are moving from thinking to answer
                             if phase_cur == "thinking" and new_phase == "answer" and think_open and settings.SHOW_THINK_TAGS:
                                 close_payload = {'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': '</think>'}, 'finish_reason': None}]}
-                                yield f"data: {json.dumps(close_payload)}\n\n" # FIX: No longer adding '\n' here
+                                yield f"data: {json.dumps(close_payload)}\n\n"
                                 think_open = False
                             phase_cur = new_phase
                         
-                        # 2. Determine the phase for the current delta
                         current_content_phase = phase_cur or new_phase
                         
-                        # 3. Process and yield content based on its phase
                         text_to_yield = ""
                         if current_content_phase == "thinking":
                             if delta and settings.SHOW_THINK_TAGS:
@@ -127,7 +119,9 @@ class ProxyHandler:
                             content_payload = {"id": comp_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": req.model, "choices": [{"index": 0, "delta": {"content": text_to_yield}, "finish_reason": None}],}
                             yield f"data: {json.dumps(content_payload)}\n\n"
         except httpx.RequestError as e:
-            if ck: await cookie_manager.mark_cookie_invalid(ck)
+            if ck:
+                # FIX: Using the correct method name `mark_cookie_failed`
+                await cookie_manager.mark_cookie_failed(ck)
             logger.error(f"Request error: {e}"); err_msg = f"Connection error: {e}"
             err = {"id": f"chatcmpl-{uuid.uuid4().hex[:29]}", "choices": [{"delta": {"content": err_msg}, "finish_reason": "stop"}]}
             yield f"data: {json.dumps(err)}\n\n"; yield "data: [DONE]\n\n"
@@ -136,20 +130,25 @@ class ProxyHandler:
             err = {"id": f"chatcmpl-{uuid.uuid4().hex[:29]}", "choices": [{"delta": {"content": "Internal error in stream"}, "finish_reason": "stop"}]}
             yield f"data: {json.dumps(err)}\n\n"; yield "data: [DONE]\n\n"
 
-    # ---------- non-stream (REVISED) ----------
+    # ---------- non-stream ----------
     async def non_stream_proxy_response(self, req: ChatCompletionRequest) -> ChatCompletionResponse:
         ck = None
         try:
             body, headers, ck = await self._prep_upstream(req)
-            # Use a list of tuples to store (phase, content) to preserve order and context
             full_content = []
             phase_cur = None
 
             async with self.client.stream("POST", settings.UPSTREAM_URL, json=body, headers=headers) as resp:
                 if resp.status_code != 200:
-                    await cookie_manager.mark_cookie_invalid(ck); error_detail = await resp.text()
+                    # FIX: Using the correct method name `mark_cookie_failed`
+                    await cookie_manager.mark_cookie_failed(ck)
+                    error_detail = await resp.text()
                     raise HTTPException(resp.status_code, f"Upstream error: {error_detail}")
 
+                # If the request was successful, the cookie is good.
+                await cookie_manager.mark_cookie_success(ck)
+
+                # The robust logic for collecting chunks from the last attempt
                 async for raw in resp.aiter_text():
                     for line in raw.strip().split('\n'):
                         line = line.strip()
@@ -171,7 +170,6 @@ class ProxyHandler:
                     else: continue
                     break
             
-            # Post-processing after collecting all chunks
             think_buf = []
             answer_buf = []
             for phase, content in full_content:
@@ -184,9 +182,8 @@ class ProxyHandler:
             final_content = ans_text
 
             if settings.SHOW_THINK_TAGS and think_buf:
-                think_text = ''.join(think_buf).strip() # .strip() here is safe
+                think_text = ''.join(think_buf).strip()
                 if think_text:
-                    # Manually add a newline if the answer doesn't start with one
                     newline = "\n" if ans_text and not ans_text.startswith(('\n', '\r')) else ""
                     final_content = f"<think>{think_text}</think>{newline}{ans_text}"
 
@@ -195,7 +192,9 @@ class ProxyHandler:
                 choices=[{"index": 0, "message": {"role": "assistant", "content": final_content}, "finish_reason": "stop"}],
             )
         except httpx.RequestError as e:
-            if ck: await cookie_manager.mark_cookie_invalid(ck)
+            if ck:
+                # FIX: Using the correct method name `mark_cookie_failed`
+                await cookie_manager.mark_cookie_failed(ck)
             logger.error(f"Non-stream request error: {e}"); raise HTTPException(502, f"Connection error: {e}")
         except Exception:
             logger.exception("Non-stream unexpected error"); raise HTTPException(500, "Internal server error")
