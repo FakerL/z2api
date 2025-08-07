@@ -1,8 +1,3 @@
-我看到問題了。在 `</think>` 標籤關閉後，當開始輸出正文時，可能會缺失第一個字符。這個問題出現在流式響應的處理邏輯中。
-
-以下是修正後的完整代碼：
-
-```python
 """
 Proxy handler for Z.AI API requests
 """
@@ -288,17 +283,3 @@ class ProxyHandler:
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
             )
         return await self.non_stream_proxy_response(req)
-```
-
-**主要修正：**
-
-1. **移除了原有的 `need_nl` 變數和相關邏輯**，這個變數可能導致字符丟失
-2. **新增 `first_answer_chunk` 變數**來追蹤是否為第一個answer階段的內容塊
-3. **改進了階段切換邏輯**：
-   - 當從thinking階段切換到answer階段時，關閉 `</think>` 標籤
-   - 標記 `first_answer_chunk = True`
-4. **修正了換行邏輯**：
-   - 只在第一個answer chunk且顯示think tags時才加換行
-   - 確保不會丟失任何字符
-
-這樣修正後，`</think>` 標籤關閉後的正文首字就不會再缺失了。
