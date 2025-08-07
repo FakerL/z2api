@@ -27,8 +27,6 @@ class ProxyHandler:
         if not self.client.is_closed:
             await self.client.aclose()
     
-    # --- START OF FINAL FIX ---
-    # NEW: Unified thinking content cleaner function
     def _clean_thinking_content(self, text: str) -> str:
         """
         A robust cleaner for the raw thinking content string.
@@ -47,9 +45,7 @@ class ProxyHandler:
         cleaned_text = cleaned_text.replace("Thinking…", "")
         # 6. Final strip to clean up any residual whitespace.
         return cleaned_text.strip()
-    # --- END OF FINAL FIX ---
 
-    # ... Methods _serialize_msgs, _prep_upstream remain the same ...
     def _serialize_msgs(self, msgs) -> list:
         out = []
         for m in msgs:
@@ -58,6 +54,7 @@ class ProxyHandler:
             elif isinstance(m, dict): out.append(m)
             else: out.append({"role": getattr(m, "role", "user"), "content": getattr(m, "content", str(m))})
         return out
+
     async def _prep_upstream(self, req: ChatCompletionRequest) -> Tuple[Dict[str, Any], Dict[str, str], str]:
         ck = await cookie_manager.get_next_cookie()
         if not ck: raise HTTPException(503, "No available cookies")
@@ -80,10 +77,12 @@ class ProxyHandler:
                     if not think_open:
                         yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': '<think>'}, 'finish_reason': None}]})}\n\n"
                         think_open = True
-                    # In stream, we clean as we go, but we don't strip the final result
-                    # as it might be part of a larger thought. We use a simpler clean here.
-                    cleaned_text = re.sub(r'<glm_block.*?</glm_block>', '', text, flags=re.DOTALL)
-                    cleaned_text = cleaned_text.replace("Thinking…", "") # Remove header early
+                    
+                    # --- START OF FINAL FIX ---
+                    # Use the unified cleaning function for streaming content as well.
+                    # This ensures consistent output with non-streaming mode.
+                    cleaned_text = self._clean_thinking_content(text)
+                    # --- END OF FINAL FIX ---
                     
                     if cleaned_text:
                         yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': cleaned_text}, 'finish_reason': None}]})}\n\n"
@@ -174,7 +173,6 @@ class ProxyHandler:
             final_ans_text = ''.join(raw_answer_parts)
             final_content = final_ans_text
             if settings.SHOW_THINK_TAGS and raw_thinking_parts:
-                # Use the new unified cleaner function
                 cleaned_think_text = self._clean_thinking_content(''.join(raw_thinking_parts))
                 if cleaned_think_text:
                     final_content = f"<think>{cleaned_think_text}</think>{final_ans_text}"
