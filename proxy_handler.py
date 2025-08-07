@@ -24,24 +24,28 @@ class ProxyHandler:
         )
 
     async def __aenter__(self): return self
-    async def __aexit__(self, exc_type, exc_val, exc_tb): await self.client.aclose()
+    async def __aexit__(self, *_): await self.client.aclose()
 
     # ---------- text utilities ----------
     def _balance_think_tag(self, txt: str) -> str:
-        opens, closes = len(re.findall(r"
+        # ensure
 
 <details type="reasoning" done="true" duration="0">
 <summary>Thought for 0 seconds</summary>
-> ", txt)), len(re.findall(r"
+> and
 </details>
-", txt))
-        if opens > closes: txt += "</think>" * (opens - closes)
+count match
+        opens = len(re.findall(r"<think>", txt))
+        closes = len(re.findall(r"</think>", txt))
+        if opens > closes:
+            txt += "</think>" * (opens - closes)
         elif closes > opens:
             for _ in range(closes - opens):
-                txt = re.sub(r"</think>(?!</think>)(?![^<]*</think>)$", "", txt, 1)
+                txt = re.sub(r"</think>(?!.*</think>)", "", txt, 1)
         return txt
 
     def _clean_thinking(self, s: str) -> str:
+        # strip html but keep text
         if not s: return s
         s = re.sub(r'<details[^>]*>|</details>|<summary[^>]*>.*?</summary>', '', s, flags=re.DOTALL)
         s = re.sub(r'<[^>]+>', '', s)
@@ -49,9 +53,11 @@ class ProxyHandler:
         return s.strip()
 
     def _clean_answer(self, s: str) -> str:
+        # remove <details> blocks
         return re.sub(r"<details[^>]*>.*?</details>", "", s, flags=re.DOTALL) if s else s
 
     def _serialize_msgs(self, msgs) -> list:
+        # convert messages to dict
         out = []
         for m in msgs:
             if hasattr(m, "dict"): out.append(m.dict())
@@ -64,6 +70,7 @@ class ProxyHandler:
     async def _prep_upstream(self, req: ChatCompletionRequest) -> Tuple[Dict[str, Any], Dict[str, str], str]:
         ck = await cookie_manager.get_next_cookie()
         if not ck: raise HTTPException(503, "No available cookies")
+
         model = settings.UPSTREAM_MODEL if req.model == settings.MODEL_NAME else req.model
         body = {
             "stream": True,
@@ -72,15 +79,17 @@ class ProxyHandler:
             "background_tasks": {"title_generation": True, "tags_generation": True},
             "chat_id": str(uuid.uuid4()),
             "features": {
-                "image_generation": False, "code_interpreter": False, "web_search": False,
-                "auto_web_search": False, "enable_thinking": True,
+                "image_generation": False, "code_interpreter": False,
+                "web_search": False, "auto_web_search": False, "enable_thinking": True,
             },
             "id": str(uuid.uuid4()),
             "mcp_servers": ["deep-web-search"],
             "model_item": {"id": model, "name": "GLM-4.5", "owned_by": "openai"},
-            "params": {}, "tool_servers": [],
+            "params": {},
+            "tool_servers": [],
             "variables": {
-                "{{USER_NAME}}": "User", "{{USER_LOCATION}}": "Unknown",
+                "{{USER_NAME}}": "User",
+                "{{USER_LOCATION}}": "Unknown",
                 "{{CURRENT_DATETIME}}": time.strftime("%Y-%m-%d %H:%M:%S"),
             },
         }
@@ -119,9 +128,7 @@ class ProxyHandler:
                 if resp.status_code != 200:
                     await cookie_manager.mark_cookie_invalid(ck)
                     err = {
-                        "id": comp_id,
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
+                        "id": comp_id, "object": "chat.completion.chunk", "created": int(time.time()),
                         "model": req.model,
                         "choices": [{"index": 0, "delta": {"content": f"Error: {resp.status_code}"}, "finish_reason": "stop"}],
                     }
@@ -132,6 +139,7 @@ class ProxyHandler:
                     for line in raw.split('\n'):
                         line = line.strip()
                         if not line or line.startswith(':') or not line.startswith('data: '): continue
+
                         payload = line[6:]
                         if payload == '[DONE]':
                             if think_open and settings.SHOW_THINK_TAGS:
@@ -153,7 +161,9 @@ class ProxyHandler:
                             continue
                         dat = parsed.get("data", {})
                         delta, phase = dat.get("delta_content", ""), dat.get("phase")
+                        if not delta: continue
 
+                        # phase change
                         if phase != phase_cur:
                             phase_cur = phase
                             if phase == "answer" and think_open and settings.SHOW_THINK_TAGS:
@@ -163,19 +173,19 @@ class ProxyHandler:
                                     "choices": [{"index": 0, "delta": {"content": "</think>"}, "finish_reason": None}],
                                 }
                                 yield f"data: {json.dumps(auto_close)}\n\n"
-                                think_open, need_nl = False, True  # add \n before first answer
+                                think_open, need_nl = False, True
 
                         if phase == "thinking" and not settings.SHOW_THINK_TAGS: continue
-                        if not delta: continue
 
-                        if phase == "thinking" and settings.SHOW_THINK_TAGS:
-                            if not think_open:
-                                tk = {
+                        if phase == "thinking":
+                            if settings.SHOW_THINK_TAGS and not think_open:
+                                open_c = {
                                     "id": comp_id, "object": "chat.completion.chunk", "created": int(time.time()),
                                     "model": req.model,
                                     "choices": [{"index": 0, "delta": {"content": "<think>"}, "finish_reason": None}],
                                 }
-                                yield f"data: {json.dumps(tk)}\n\n"; think_open = True
+                                yield f"data: {json.dumps(open_c)}\n\n"
+                                think_open = True
                             text = self._clean_thinking(delta)
                         else:
                             if need_nl:
@@ -194,20 +204,16 @@ class ProxyHandler:
         except httpx.RequestError as e:
             logger.error(f"Request error: {e}")
             err = {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:29]}",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": req.model,
+                "id": f"chatcmpl-{uuid.uuid4().hex[:29]}", "object": "chat.completion.chunk",
+                "created": int(time.time()), "model": req.model,
                 "choices": [{"index": 0, "delta": {"content": f"Connection error: {e}"}, "finish_reason": "stop"}],
             }
             yield f"data: {json.dumps(err)}\n\n"; yield "data: [DONE]\n\n"
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
             err = {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:29]}",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": req.model,
+                "id": f"chatcmpl-{uuid.uuid4().hex[:29]}", "object": "chat.completion.chunk",
+                "created": int(time.time()), "model": req.model,
                 "choices": [{"index": 0, "delta": {"content": f"Internal error: {e}"}, "finish_reason": "stop"}],
             }
             yield f"data: {json.dumps(err)}\n\n"; yield "data: [DONE]\n\n"
@@ -224,7 +230,7 @@ class ProxyHandler:
                 http2=True,
             )
             body, headers, ck = await self._prep_upstream(req)
-            think_buf, answer_buf, phase_cur = [], [], None
+            think_buf, answer_buf = [], []
 
             async with client.stream("POST", settings.UPSTREAM_URL, json=body, headers=headers) as resp:
                 if resp.status_code != 200:
