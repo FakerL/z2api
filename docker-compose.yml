@@ -1,0 +1,10 @@
+services:
+  z2api:
+    container_name: z2api 
+    image: z
+    restart: always
+    ports:
+      - "3000:7860"
+    volumes:
+      - .:/app
+      - ./data:/data
