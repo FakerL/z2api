@@ -39,16 +39,21 @@ class ProxyHandler:
         return txt
 
     def _clean_thinking(self, s: str) -> str:
-        # strip html but keep text
+        # strip html but keep text, be more careful about content preservation
         if not s: return s
-        s = re.sub(r'<details[^>]*>|</details>|<summary[^>]*>.*?</summary>', '', s, flags=re.DOTALL)
+        # Remove details/summary blocks
+        s = re.sub(r'<details[^>]*>.*?</details>', '', s, flags=re.DOTALL)
+        s = re.sub(r'<summary[^>]*>.*?</summary>', '', s, flags=re.DOTALL)
+        # Remove other HTML tags but preserve content
         s = re.sub(r'<[^>]+>', '', s)
-        s = re.sub(r'^>\s*|\n>\s*', '\n', s)
+        # Clean up markdown-style quotes at line start
+        s = re.sub(r'^\s*>\s*', '', s, flags=re.MULTILINE)
         return s.strip()
 
     def _clean_answer(self, s: str) -> str:
-        # remove <details> blocks
-        return re.sub(r"<details[^>]*>.*?</details>", "", s, flags=re.DOTALL) if s else s
+        # remove <details> blocks but preserve other content
+        if not s: return s
+        return re.sub(r"<details[^>]*>.*?</details>", "", s, flags=re.DOTALL)
 
     def _serialize_msgs(self, msgs) -> list:
         # convert messages to dict
@@ -175,6 +180,7 @@ class ProxyHandler:
                         if phase == "thinking" and not settings.SHOW_THINK_TAGS: 
                             continue
 
+                        # 處理內容，但不要過度清理
                         if phase == "thinking":
                             if settings.SHOW_THINK_TAGS and not think_open:
                                 open_c = {
@@ -184,14 +190,17 @@ class ProxyHandler:
                                 }
                                 yield f"data: {json.dumps(open_c)}\n\n"
                                 think_open = True
-                            text = self._clean_thinking(delta)
+                            # 對thinking內容進行最小化清理
+                            text = self._clean_thinking(delta) if delta else ""
                         else:  # answer phase
-                            text = self._clean_answer(delta)
+                            # 對answer內容進行最小化清理，主要只移除details標籤
+                            text = self._clean_answer(delta) if delta else ""
                             # 如果是第一個answer chunk且顯示think tags，在前面加上換行
-                            if first_answer_chunk and settings.SHOW_THINK_TAGS and text:
+                            if first_answer_chunk and settings.SHOW_THINK_TAGS and text.strip():
                                 text = "\n" + text
                                 first_answer_chunk = False
 
+                        # 只有在text有內容時才輸出
                         if text:
                             out = {
                                 "id": comp_id, "object": "chat.completion.chunk", "created": int(time.time()),
@@ -247,12 +256,19 @@ class ProxyHandler:
                         dat = parsed.get("data", {})
                         delta, phase = dat.get("delta_content", ""), dat.get("phase")
                         if not delta: continue
-                        if phase == "thinking": think_buf.append(delta)
-                        elif phase == "answer": answer_buf.append(delta)
+                        # 直接保存原始內容，不在這裡進行清理
+                        if phase == "thinking": 
+                            think_buf.append(delta)
+                        elif phase == "answer": 
+                            answer_buf.append(delta)
 
-            ans_text = self._clean_answer(''.join(answer_buf))
+            # 合併內容後再進行清理
+            raw_answer = ''.join(answer_buf)
+            ans_text = self._clean_answer(raw_answer) if raw_answer else ""
+            
             if settings.SHOW_THINK_TAGS and think_buf:
-                think_text = self._clean_thinking(''.join(think_buf))
+                raw_thinking = ''.join(think_buf)
+                think_text = self._clean_thinking(raw_thinking) if raw_thinking else ""
                 final = f"<think>{think_text}</think>\n{ans_text}"
             else:
                 final = ans_text
