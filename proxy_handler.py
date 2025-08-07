@@ -155,10 +155,45 @@ class ProxyHandler:
         }
         return body, headers, cookie
 
+    # Utilities
+
+    def _mk_chunk(self, cid: str, model: str, content: str) -> str:
+        """Create a chunk and return with data: prefix"""
+        chunk = {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": None
+            }]
+        }
+        return f"data: {json.dumps(chunk)}\n\n"
+
+    async def _error_chunks_async(self, model: str, msg: str):
+        """Generate error output (async generator)"""
+        cid = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+        err = {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {"content": msg},
+                "finish_reason": "stop"
+            }]
+        }
+        yield f"data: {json.dumps(err)}\n\n"
+        yield "data: [DONE]\n\n"
+
     # Streaming response
 
     async def stream_proxy_response(self, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
         client = None
+        cookie = None
         try:
             client = httpx.AsyncClient(
                 timeout=httpx.Timeout(60.0, read=300.0),
@@ -261,18 +296,21 @@ class ProxyHandler:
 
         except httpx.RequestError as e:
             logger.error(f"Request error: {e}")
-            if 'cookie' in locals():
+            if cookie:
                 await cookie_manager.mark_cookie_invalid(cookie)
-            yield from self._error_chunks(request.model, "Upstream connection error")
+            async for chunk in self._error_chunks_async(request.model, "Upstream connection error"):
+                yield chunk
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
-            yield from self._error_chunks(request.model, "Internal server error")
+            async for chunk in self._error_chunks_async(request.model, "Internal server error"):
+                yield chunk
         finally:
             if client:
                 await client.aclose()
 
     async def non_stream_proxy_response(self, request: ChatCompletionRequest):
         client = None
+        cookie = None
         try:
             client = httpx.AsyncClient(
                 timeout=httpx.Timeout(60.0, read=300.0),
@@ -340,7 +378,7 @@ class ProxyHandler:
 
         except httpx.RequestError as e:
             logger.error(f"Request error: {e}")
-            if 'cookie' in locals():
+            if cookie:
                 await cookie_manager.mark_cookie_invalid(cookie)
             raise HTTPException(status_code=502, detail="Upstream connection error")
         except Exception as e:
@@ -349,40 +387,6 @@ class ProxyHandler:
         finally:
             if client:
                 await client.aclose()
-
-    # Utilities
-
-    def _mk_chunk(self, cid: str, model: str, content: str) -> str:
-        """Create a chunk and return with data: prefix"""
-        chunk = {
-            "id": cid,
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {"content": content},
-                "finish_reason": None
-            }]
-        }
-        return f"data: {json.dumps(chunk)}\n\n"
-
-    def _error_chunks(self, model: str, msg: str):
-        """Generate error output (generator)"""
-        cid = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-        err = {
-            "id": cid,
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [{
-                "index": 0,
-                "delta": {"content": msg},
-                "finish_reason": "stop"
-            }]
-        }
-        yield f"data: {json.dumps(err)}\n\n"
-        yield "data: [DONE]\n\n"
 
     # FastAPI entry point
 
