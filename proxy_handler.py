@@ -1,6 +1,6 @@
 """
 Proxy handler for Z.AI API requests
-Updated: 2025-08-06 (Revised to fix streaming boundary issues)
+Updated: 2025-08-06 (Final fix for streaming boundary issues)
 """
 
 import json
@@ -27,15 +27,12 @@ logger = logging.getLogger(__name__)
 
 class ProxyHandler:
     def __init__(self):
-        # The main client is now managed per-request to avoid potential concurrency issues
-        # with shared clients across different requests. This is a more robust pattern for FastAPI.
         pass
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        # No shared client to close here anymore
         pass
 
     # Content transformation utilities
@@ -187,36 +184,36 @@ class ProxyHandler:
                             delta_content = data.get("delta_content", "")
                             phase = data.get("phase")
 
-                            # --- START OF REVISED LOGIC ---
-                            content_to_send = ""
+                            # --- START OF THE FINAL FIX ---
+                            # This logic ensures state transitions are handled atomically and correctly.
                             
-                            # 1. Handle phase transitions atomically
-                            if phase and phase != current_phase:
-                                if current_phase == "thinking" and think_open and settings.SHOW_THINK_TAGS:
-                                    # Close the think tag when phase changes away from thinking
-                                    content_to_send += "</think>"
-                                    think_open = False
+                            prefix = ""
+                            main_content = ""
+                            
+                            # Determine prefix based on state *before* this event.
+                            # Case 1: Transitioning from thinking to answer.
+                            if phase == "answer" and current_phase == "thinking" and settings.SHOW_THINK_TAGS and think_open:
+                                prefix += "</think>"
+                                think_open = False # State change for the tag
+                            
+                            # Case 2: Starting the thinking phase.
+                            elif phase == "thinking" and not think_open and settings.SHOW_THINK_TAGS:
+                                prefix += "<think>"
+                                think_open = True # State change for the tag
+                                
+                            # Process the main content of the event.
+                            if delta_content:
+                                if phase == "thinking" and settings.SHOW_THINK_TAGS:
+                                    main_content = self._clean_thinking_content(delta_content)
+                                elif phase == "answer":
+                                    main_content = self._clean_answer_content(delta_content)
+
+                            # Update the phase state *after* all logic for this event is complete.
+                            if phase:
                                 current_phase = phase
 
-                            # 2. Skip unwanted content
-                            if current_phase == "thinking" and not settings.SHOW_THINK_TAGS:
-                                continue
-                            
-                            # 3. Process content based on the current phase
-                            if delta_content:
-                                if current_phase == "thinking" and settings.SHOW_THINK_TAGS:
-                                    cleaned_delta = self._clean_thinking_content(delta_content)
-                                    # Open the think tag if it's the first time
-                                    if not think_open:
-                                        content_to_send += "<think>"
-                                        think_open = True
-                                    content_to_send += cleaned_delta
-                                elif current_phase == "answer":
-                                    # For the answer phase, just clean and append
-                                    cleaned_delta = self._clean_answer_content(delta_content)
-                                    content_to_send += cleaned_delta
-
-                            # 4. Yield a chunk only if there is content to send
+                            # Combine and yield.
+                            content_to_send = prefix + main_content
                             if content_to_send:
                                 chunk = {
                                     "id": completion_id, "object": "chat.completion.chunk",
@@ -224,7 +221,7 @@ class ProxyHandler:
                                     "choices": [{ "index": 0, "delta": {"content": content_to_send}, "finish_reason": None }]
                                 }
                                 yield f"data: {json.dumps(chunk)}\n\n"
-                            # --- END OF REVISED LOGIC ---
+                            # --- END OF THE FINAL FIX ---
 
                 if buffer.strip():
                     logger.warning(f"Incomplete event in buffer at end: {buffer[:100]}...")
@@ -245,6 +242,7 @@ class ProxyHandler:
 
     async def non_stream_proxy_response(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         """Handle non-streaming proxy response"""
+        # This function remains robust as it processes the entire content at once.
         client = None
         cookie = None
         try:
@@ -306,7 +304,6 @@ class ProxyHandler:
             else:
                 final_text = answer_text
             
-            # Final balance check for non-streaming response as a safeguard
             final_text = self._balance_think_tag(final_text)
 
             return ChatCompletionResponse(
