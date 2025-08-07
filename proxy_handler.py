@@ -27,7 +27,7 @@ class ProxyHandler:
         if not self.client.is_closed:
             await self.client.aclose()
 
-    # --- Text utilities (REVISED _clean_answer) ---
+    # --- Text utilities remain the same from the last version ---
     def _clean_thinking(self, s: str) -> str:
         if not s: return ""
         s = re.sub(r'<details[^>]*>.*?</details>', '', s, flags=re.DOTALL)
@@ -37,21 +37,13 @@ class ProxyHandler:
         return s
 
     def _clean_answer(self, s: str, from_edit_content: bool = False) -> str:
-        """
-        Cleans the answer string.
-        If from_edit_content is True, it extracts only the content after the last </details> tag.
-        """
         if not s: return ""
-        
         if from_edit_content:
             last_details_pos = s.rfind('</details>')
             if last_details_pos != -1:
                 s = s[last_details_pos + len('</details>'):]
-        
         s = re.sub(r"<details[^>]*>.*?</details>", "", s, flags=re.DOTALL)
-        
-        # FIX: Use a more specific lstrip to only remove leading newlines,
-        # but preserve leading spaces which are important for markdown.
+        # We keep the lstrip logic as it is, but we will handle yielding empty strings differently.
         return s.lstrip('\n\r')
 
     # ... Other methods like _serialize_msgs, _prep_upstream remain the same ...
@@ -71,12 +63,15 @@ class ProxyHandler:
         headers = { "Content-Type": "application/json", "Authorization": f"Bearer {ck}", "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"), "Accept": "application/json, text/event-stream", "Accept-Language": "zh-CN", "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"', "sec-ch-ua-mobile": "?0", "sec-ch-ua-platform": '"macOS"', "x-fe-version": "prod-fe-1.0.53", "Origin": "https://chat.z.ai", "Referer": "https://chat.z.ai/",}
         return body, headers, ck
         
-    # ---------- stream ----------
+    # ---------- stream (REVISED YIELD LOGIC) ----------
     async def stream_proxy_response(self, req: ChatCompletionRequest) -> AsyncGenerator[str, None]:
         ck = None
         try:
             body, headers, ck = await self._prep_upstream(req)
             comp_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"; think_open = False; phase_cur = None
+            # FIX: New flag to track if we've started sending content.
+            has_yielded_content = False
+
             async with self.client.stream("POST", settings.UPSTREAM_URL, json=body, headers=headers) as resp:
                 if resp.status_code != 200:
                     await cookie_manager.mark_cookie_failed(ck); err_body = await resp.aread()
@@ -117,18 +112,27 @@ class ProxyHandler:
                                 if not think_open:
                                     open_payload = {'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': '<think>'}, 'finish_reason': None}]}
                                     yield f"data: {json.dumps(open_payload)}\n\n"
+                                    has_yielded_content = True
                                     think_open = True
                                 text_to_yield = self._clean_thinking(content)
                         elif current_content_phase == "answer":
                             text_to_yield = self._clean_answer(content, from_edit_content=is_edit)
 
-                        if text_to_yield:
+                        # FIX: Revised yield logic.
+                        # We yield if there's content, OR if we've already started yielding and the content is an empty string
+                        # (which could be a meaningful newline that was stripped).
+                        if text_to_yield or (has_yielded_content and content is not None and text_to_yield == ""):
                             content_payload = {"id": comp_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": req.model, "choices": [{"index": 0, "delta": {"content": text_to_yield}, "finish_reason": None}],}
                             yield f"data: {json.dumps(content_payload)}\n\n"
+                            if text_to_yield: # Only set the flag if we actually sent non-empty content.
+                                has_yielded_content = True
+
         except Exception:
             logger.exception("Stream error"); raise
 
     # ---------- non-stream ----------
+    # The non-stream version is less susceptible to this issue because it processes all content at once.
+    # The existing logic should be sufficient. No changes needed here.
     async def non_stream_proxy_response(self, req: ChatCompletionRequest) -> ChatCompletionResponse:
         ck = None
         try:
@@ -171,7 +175,6 @@ class ProxyHandler:
             if settings.SHOW_THINK_TAGS and think_buf:
                 think_text = ''.join(think_buf).strip()
                 if think_text:
-                    # The newline is handled by the answer itself now, so we can just concatenate.
                     final_content = f"<think>{think_text}</think>{ans_text}"
 
             return ChatCompletionResponse(
