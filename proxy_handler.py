@@ -27,7 +27,7 @@ class ProxyHandler:
         if not self.client.is_closed:
             await self.client.aclose()
 
-    # --- Text utilities and other methods remain the same ---
+    # --- Text utilities (REVISED _clean_answer_from_edit) ---
     def _clean_thinking(self, s: str) -> str:
         if not s: return ""
         s = re.sub(r'<details[^>]*>.*?</details>', '', s, flags=re.DOTALL)
@@ -35,9 +35,26 @@ class ProxyHandler:
         s = re.sub(r'<[^>]+>', '', s)
         s = re.sub(r'^\s*>\s*', '', s, flags=re.MULTILINE)
         return s
-    def _clean_answer(self, s: str) -> str:
+
+    def _clean_answer(self, s: str, from_edit_content: bool = False) -> str:
+        """
+        Cleans the answer string.
+        If from_edit_content is True, it extracts only the content after the last </details> tag.
+        """
         if not s: return ""
-        return re.sub(r"<details[^>]*>.*?</details>", "", s, flags=re.DOTALL)
+        
+        if from_edit_content:
+            # Find the position of the last </details> tag
+            last_details_pos = s.rfind('</details>')
+            if last_details_pos != -1:
+                # Extract everything after the tag
+                s = s[last_details_pos + len('</details>'):]
+        
+        # General cleanup for any remaining <details> blocks (just in case)
+        s = re.sub(r"<details[^>]*>.*?</details>", "", s, flags=re.DOTALL)
+        return s.lstrip() # Use lstrip to remove leading whitespace like '\n' but keep internal space
+
+    # ... Other methods like _serialize_msgs, _prep_upstream remain the same ...
     def _serialize_msgs(self, msgs) -> list:
         out = []
         for m in msgs:
@@ -53,7 +70,7 @@ class ProxyHandler:
         body = { "stream": True, "model": model, "messages": self._serialize_msgs(req.messages), "background_tasks": {"title_generation": True, "tags_generation": True}, "chat_id": str(uuid.uuid4()), "features": {"image_generation": False, "code_interpreter": False, "web_search": False, "auto_web_search": False, "enable_thinking": True,}, "id": str(uuid.uuid4()), "mcp_servers": ["deep-web-search"], "model_item": {"id": model, "name": "GLM-4.5", "owned_by": "openai"}, "params": {}, "tool_servers": [], "variables": {"{{USER_NAME}}": "User", "{{USER_LOCATION}}": "Unknown", "{{CURRENT_DATETIME}}": time.strftime("%Y-%m-%d %H:%M:%S"),},}
         headers = { "Content-Type": "application/json", "Authorization": f"Bearer {ck}", "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"), "Accept": "application/json, text/event-stream", "Accept-Language": "zh-CN", "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"', "sec-ch-ua-mobile": "?0", "sec-ch-ua-platform": '"macOS"', "x-fe-version": "prod-fe-1.0.53", "Origin": "https://chat.z.ai", "Referer": "https://chat.z.ai/",}
         return body, headers, ck
-
+        
     # ---------- stream ----------
     async def stream_proxy_response(self, req: ChatCompletionRequest) -> AsyncGenerator[str, None]:
         ck = None
@@ -65,8 +82,8 @@ class ProxyHandler:
 
             async with self.client.stream("POST", settings.UPSTREAM_URL, json=body, headers=headers) as resp:
                 if resp.status_code != 200:
-                    await cookie_manager.mark_cookie_failed(ck)
-                    err_body = await resp.aread(); err_msg = f"Error: {resp.status_code} - {err_body.decode(errors='ignore')}"
+                    await cookie_manager.mark_cookie_failed(ck); err_body = await resp.aread()
+                    err_msg = f"Error: {resp.status_code} - {err_body.decode(errors='ignore')}"
                     err = {"id": comp_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": req.model, "choices": [{"index": 0, "delta": {"content": err_msg}, "finish_reason": "stop"}],}
                     yield f"data: {json.dumps(err)}\n\n"; yield "data: [DONE]\n\n"; return
                 await cookie_manager.mark_cookie_success(ck)
@@ -77,15 +94,14 @@ class ProxyHandler:
                         if not line or not line.startswith('data: '): continue
                         payload_str = line[6:]
                         if payload_str == '[DONE]':
-                            if think_open:
-                                yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': '</think>'}, 'finish_reason': None}]})}\n\n"
-                            yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
-                            yield "data: [DONE]\n\n"; return
+                            if think_open: yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': '</think>'}, 'finish_reason': None}]})}\n\n"
+                            yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"; yield "data: [DONE]\n\n"; return
                         try:
                             dat = json.loads(payload_str).get("data", {})
                         except (json.JSONDecodeError, AttributeError): continue
                         
-                        # --- FINAL FIX: Handle both delta_content and edit_content ---
+                        # FIX: Differentiate content source
+                        is_edit = "edit_content" in dat
                         content = dat.get("delta_content", "") or dat.get("edit_content", "")
                         new_phase = dat.get("phase")
 
@@ -108,15 +124,14 @@ class ProxyHandler:
                                     think_open = True
                                 text_to_yield = self._clean_thinking(content)
                         elif current_content_phase == "answer":
-                            text_to_yield = self._clean_answer(content)
+                            # FIX: Use the new cleaning logic
+                            text_to_yield = self._clean_answer(content, from_edit_content=is_edit)
 
                         if text_to_yield:
                             content_payload = {"id": comp_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": req.model, "choices": [{"index": 0, "delta": {"content": text_to_yield}, "finish_reason": None}],}
                             yield f"data: {json.dumps(content_payload)}\n\n"
         except Exception:
-            logger.exception("Stream error")
-            # You might want to yield an error to the client here as well
-            raise
+            logger.exception("Stream error"); raise
 
     # ---------- non-stream ----------
     async def non_stream_proxy_response(self, req: ChatCompletionRequest) -> ChatCompletionResponse:
@@ -128,8 +143,7 @@ class ProxyHandler:
 
             async with self.client.stream("POST", settings.UPSTREAM_URL, json=body, headers=headers) as resp:
                 if resp.status_code != 200:
-                    await cookie_manager.mark_cookie_failed(ck)
-                    error_detail = await resp.text()
+                    await cookie_manager.mark_cookie_failed(ck); error_detail = await resp.text()
                     raise HTTPException(resp.status_code, f"Upstream error: {error_detail}")
                 await cookie_manager.mark_cookie_success(ck)
                 
@@ -143,27 +157,25 @@ class ProxyHandler:
                             dat = json.loads(payload_str).get("data", {})
                         except (json.JSONDecodeError, AttributeError): continue
                         
-                        # --- FINAL FIX: Handle both delta_content and edit_content ---
+                        is_edit = "edit_content" in dat
                         content = dat.get("delta_content") or dat.get("edit_content")
                         new_phase = dat.get("phase")
                         
-                        if new_phase:
-                            phase_cur = new_phase
-                        
+                        if new_phase: phase_cur = new_phase
                         if content and phase_cur:
-                            full_content.append((phase_cur, content))
+                            # Store the content along with its source (is_edit)
+                            full_content.append((phase_cur, content, is_edit))
                     else: continue
                     break
             
             think_buf = []
             answer_buf = []
-            for phase, content in full_content:
+            for phase, content, is_edit in full_content:
                 if phase == "thinking":
                     think_buf.append(self._clean_thinking(content))
                 elif phase == "answer":
-                    # For edit_content, it can contain both thinking and answer parts.
-                    # We only want the answer part. Let's clean it again.
-                    answer_buf.append(self._clean_answer(content))
+                    # FIX: Use the new cleaning logic
+                    answer_buf.append(self._clean_answer(content, from_edit_content=is_edit))
             
             ans_text = ''.join(answer_buf)
             final_content = ans_text
@@ -171,16 +183,15 @@ class ProxyHandler:
             if settings.SHOW_THINK_TAGS and think_buf:
                 think_text = ''.join(think_buf).strip()
                 if think_text:
-                    newline = "\n" if ans_text and not ans_text.startswith(('\n', '\r')) else ""
-                    final_content = f"<think>{think_text}</think>{newline}{ans_text}"
+                    # No longer need to manually add newline, as .lstrip() in _clean_answer handles it
+                    final_content = f"<think>{think_text}</think>{ans_text}"
 
             return ChatCompletionResponse(
                 id=f"chatcmpl-{uuid.uuid4().hex[:29]}", created=int(time.time()), model=req.model,
                 choices=[{"index": 0, "message": {"role": "assistant", "content": final_content}, "finish_reason": "stop"}],
             )
         except Exception:
-            logger.exception("Non-stream processing failed")
-            raise
+            logger.exception("Non-stream processing failed"); raise
 
     # ---------- FastAPI entry ----------
     async def handle_chat_completion(self, req: ChatCompletionRequest):
