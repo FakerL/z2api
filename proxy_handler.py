@@ -24,15 +24,12 @@ class ProxyHandler:
             http2=True,
         )
 
-    # FIX: 移除 __aenter__ 和 __aexit__，改用顯式的 aclose 方法
-    # aenter/aexit 模式不適用於需要跨越請求生命週期的流式響應
     async def aclose(self):
         """Closes the underlying httpx client."""
         if not self.client.is_closed:
             await self.client.aclose()
 
     # ---------- text utilities ----------
-    # _balance_think_tag, _clean_thinking, _clean_answer, _serialize_msgs 方法保持不變
     def _balance_think_tag(self, txt: str) -> str:
         opens = len(re.findall(r"<think>", txt))
         closes = len(re.findall(r"</think>", txt))
@@ -66,7 +63,6 @@ class ProxyHandler:
 
     # ---------- upstream ----------
     async def _prep_upstream(self, req: ChatCompletionRequest) -> Tuple[Dict[str, Any], Dict[str, str], str]:
-        # 此方法保持不變
         ck = await cookie_manager.get_next_cookie()
         if not ck: raise HTTPException(503, "No available cookies")
 
@@ -96,8 +92,6 @@ class ProxyHandler:
             body, headers, ck = await self._prep_upstream(req)
             comp_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
             think_open = False
-            
-            # FIX: 維護一個持久的 phase 狀態
             phase_cur = None
 
             async with self.client.stream("POST", settings.UPSTREAM_URL, json=body, headers=headers) as resp:
@@ -120,8 +114,11 @@ class ProxyHandler:
                         payload = line[6:]
                         if payload == '[DONE]':
                             if think_open:
-                                yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': '</think>'}, 'finish_reason': None}]})}\n\n"
-                            yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                                close_think_chunk = {'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': '</think>'}, 'finish_reason': None}]}
+                                yield f"data: {json.dumps(close_think_chunk)}\n\n"
+                            
+                            final_chunk = {'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]}
+                            yield f"data: {json.dumps(final_chunk)}\n\n"
                             yield "data: [DONE]\n\n"; return
 
                         try:
@@ -132,45 +129,49 @@ class ProxyHandler:
                         dat = parsed.get("data", {})
                         delta, new_phase = dat.get("delta_content", ""), dat.get("phase")
 
-                        # FIX: 正確的狀態管理邏輯
-                        # 1. 如果收到了新的 phase，更新當前 phase
                         if new_phase and new_phase != phase_cur:
-                            # 處理從 thinking 到 answer 的過渡
                             if phase_cur == "thinking" and new_phase == "answer" and think_open and settings.SHOW_THINK_TAGS:
-                                yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': '</think>\n'}, 'finish_reason': None}]})}\n\n"
+                                # --- FIX START ---
+                                # 將包含反斜線的字典先創建好，再放入 f-string
+                                close_payload = {
+                                    'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()),
+                                    'model': req.model,
+                                    'choices': [{'index': 0, 'delta': {'content': '</think>\n'}, 'finish_reason': None}]
+                                }
+                                yield f"data: {json.dumps(close_payload)}\n\n"
+                                # --- FIX END ---
                                 think_open = False
                             phase_cur = new_phase
                         
-                        if not delta: continue # 如果沒有內容，則跳過
+                        if not delta: continue
 
-                        # 2. 根據當前的 phase_cur 處理內容
                         text_to_yield = ""
                         if phase_cur == "thinking":
                             if settings.SHOW_THINK_TAGS:
                                 if not think_open:
-                                    yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': '<think>'}, 'finish_reason': None}]})}\n\n"
+                                    open_think_chunk = {'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': '<think>'}, 'finish_reason': None}]}
+                                    yield f"data: {json.dumps(open_think_chunk)}\n\n"
                                     think_open = True
                                 text_to_yield = self._clean_thinking(delta)
                         elif phase_cur == "answer":
                             text_to_yield = self._clean_answer(delta)
 
-                        # 3. 發送處理後的內容
                         if text_to_yield:
-                            out = {
+                            out_chunk = {
                                 "id": comp_id, "object": "chat.completion.chunk", "created": int(time.time()), "model": req.model,
                                 "choices": [{"index": 0, "delta": {"content": text_to_yield}, "finish_reason": None}],
                             }
-                            yield f"data: {json.dumps(out)}\n\n"
+                            yield f"data: {json.dumps(out_chunk)}\n\n"
 
         except httpx.RequestError as e:
             if ck: await cookie_manager.mark_cookie_invalid(ck)
             logger.error(f"Request error: {e}")
             err_msg = f"Connection error: {e}"
-            err = {"choices": [{"delta": {"content": err_msg}, "finish_reason": "stop"}]}
+            err = {"id": f"chatcmpl-{uuid.uuid4().hex[:29]}", "choices": [{"delta": {"content": err_msg}, "finish_reason": "stop"}]}
             yield f"data: {json.dumps(err)}\n\n"; yield "data: [DONE]\n\n"
         except Exception as e:
             logger.exception(f"Unexpected error in stream_proxy_response")
-            err = {"choices": [{"delta": {"content": f"Internal error in stream"}, "finish_reason": "stop"}]}
+            err = {"id": f"chatcmpl-{uuid.uuid4().hex[:29]}", "choices": [{"delta": {"content": f"Internal error in stream"}, "finish_reason": "stop"}]}
             yield f"data: {json.dumps(err)}\n\n"; yield "data: [DONE]\n\n"
 
     # ---------- non-stream ----------
@@ -180,7 +181,6 @@ class ProxyHandler:
             body, headers, ck = await self._prep_upstream(req)
             think_buf, answer_buf = [], []
             
-            # FIX: 維護一個持久的 phase 狀態
             phase_cur = None
 
             async with self.client.stream("POST", settings.UPSTREAM_URL, json=body, headers=headers) as resp:
@@ -203,19 +203,16 @@ class ProxyHandler:
                         dat = parsed.get("data", {})
                         delta, new_phase = dat.get("delta_content", ""), dat.get("phase")
                         
-                        # FIX: 正確的狀態管理邏輯
-                        # 1. 更新當前 phase
                         if new_phase:
                             phase_cur = new_phase
                         
                         if not delta: continue
                         
-                        # 2. 根據當前的 phase_cur 存儲內容
                         if phase_cur == "thinking": 
                             think_buf.append(delta)
                         elif phase_cur == "answer": 
                             answer_buf.append(delta)
-                else: # for-else, will be executed if loop finishes without break
+                else:
                     pass
             
             raw_answer = ''.join(answer_buf)
