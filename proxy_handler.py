@@ -26,18 +26,8 @@ class ProxyHandler:
     async def aclose(self):
         if not self.client.is_closed:
             await self.client.aclose()
-
-    # --- Text utilities ---
-    # These are now simplified, as the main logic will handle parsing.
-    def _clean_html_and_quotes(self, s: str) -> str:
-        if not s: return ""
-        s = re.sub(r'<details[^>]*>.*?</details>', '', s, flags=re.DOTALL)
-        s = re.sub(r'<summary[^>]*>.*?</summary>', '', s, flags=re.DOTALL)
-        s = re.sub(r'<[^>]+>', '', s)
-        s = re.sub(r'^\s*>\s*', '', s, flags=re.MULTILINE)
-        return s
-
-    # ... Other methods like _serialize_msgs, _prep_upstream remain the same ...
+    
+    # ... Methods _serialize_msgs, _prep_upstream remain the same ...
     def _serialize_msgs(self, msgs) -> list:
         out = []
         for m in msgs:
@@ -54,53 +44,27 @@ class ProxyHandler:
         headers = { "Content-Type": "application/json", "Authorization": f"Bearer {ck}", "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"), "Accept": "application/json, text/event-stream", "Accept-Language": "zh-CN", "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"', "sec-ch-ua-mobile": "?0", "sec-ch-ua-platform": '"macOS"', "x-fe-version": "prod-fe-1.0.53", "Origin": "https://chat.z.ai", "Referer": "https://chat.z.ai/",}
         return body, headers, ck
 
-    # --- NEW: Unified Chunk Parser ---
-    def _parse_chunk(self, dat: Dict[str, Any]) -> List[Tuple[str, str]]:
-        """
-        Parses a single data chunk from Z.AI and returns a list of (type, content) tuples.
-        Type can be 'thinking' or 'answer'.
-        This function is the core of the new logic, designed to be robust.
-        """
-        if not dat:
-            return []
-
-        content = dat.get("delta_content")
-        edit_content = dat.get("edit_content")
-        phase = dat.get("phase")
-
-        # Case 1: Simple delta_content chunk
-        if content and not edit_content:
-            if phase in ["thinking", "answer"]:
-                return [(phase, content)]
-            return []
-
-        # Case 2: Complex edit_content chunk (the source of most problems)
-        if edit_content:
-            # edit_content can contain both thinking and answer parts.
-            # We split it by the last </details> tag.
-            parts = edit_content.rsplit('</details>', 1)
-            
-            # This is a heuristic, but it's based on observed data.
-            # If split results in 2 parts, the first is thinking, the second is answer.
-            if len(parts) == 2:
-                thinking_part, answer_part = parts
-                return [("thinking", thinking_part + '</details>'), ("answer", answer_part)]
-            else:
-                # If no </details>, the whole thing is likely an answer or thinking chunk.
-                if phase in ["thinking", "answer"]:
-                    return [(phase, edit_content)]
-        
-        # Case 3: A chunk that only changes phase, without content.
-        # We don't need to do anything, the state will be updated in the main loop.
-
-        return []
-
-    # ---------- stream (REBUILT) ----------
+    # ---------- stream (REBUILT WITH STATE MACHINE) ----------
     async def stream_proxy_response(self, req: ChatCompletionRequest) -> AsyncGenerator[str, None]:
         ck = None
         try:
             body, headers, ck = await self._prep_upstream(req)
             comp_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"; think_open = False; phase_cur = None
+
+            async def yield_content(content_type: str, text: str):
+                nonlocal think_open
+                if not text: return
+                
+                if content_type == "thinking" and settings.SHOW_THINK_TAGS:
+                    if not think_open:
+                        yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': '<think>'}, 'finish_reason': None}]})}\n\n"
+                        think_open = True
+                    yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': text}, 'finish_reason': None}]})}\n\n"
+                elif content_type == "answer":
+                    if think_open:
+                        yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': '</think>'}, 'finish_reason': None}]})}\n\n"
+                        think_open = False
+                    yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': text}, 'finish_reason': None}]})}\n\n"
 
             async with self.client.stream("POST", settings.UPSTREAM_URL, json=body, headers=headers) as resp:
                 if resp.status_code != 200:
@@ -123,43 +87,33 @@ class ProxyHandler:
                         except (json.JSONDecodeError, AttributeError): continue
                         
                         new_phase = dat.get("phase")
+                        if new_phase: phase_cur = new_phase
+                        if not phase_cur: continue
                         
-                        # Handle phase transition side-effect
-                        if new_phase and new_phase != phase_cur:
-                            if phase_cur == "thinking" and think_open and settings.SHOW_THINK_TAGS:
-                                yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': '</think>'}, 'finish_reason': None}]})}\n\n"
-                                think_open = False
-                            phase_cur = new_phase
-                        
-                        # Use the unified parser
-                        parsed_parts = self._parse_chunk(dat)
-                        
-                        for part_type, part_content in parsed_parts:
-                            text_to_yield = ""
-                            if part_type == "thinking":
-                                if settings.SHOW_THINK_TAGS:
-                                    if not think_open:
-                                        yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': '<think>'}, 'finish_reason': None}]})}\n\n"
-                                        think_open = True
-                                    text_to_yield = self._clean_html_and_quotes(part_content)
-                            elif part_type == "answer":
-                                # For answer, we pass it through raw to preserve all formatting.
-                                text_to_yield = part_content
-                            
-                            # Always yield, even if empty, to preserve timing and newlines.
-                            # The check `if part_content is not None` is implicit in the loop.
-                            yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': text_to_yield}, 'finish_reason': None}]})}\n\n"
+                        content = dat.get("delta_content") or dat.get("edit_content")
+                        if not content: continue
 
+                        # Remove tool call blocks
+                        content = re.sub(r'<glm_block.*?</glm_block>', '', content, flags=re.DOTALL)
+                        
+                        # Handle mixed content from edit_content
+                        match = re.search(r'(.*</details>)(.*)', content, flags=re.DOTALL)
+                        if match:
+                            thinking_part, answer_part = match.groups()
+                            async for item in yield_content("thinking", thinking_part): yield item
+                            async for item in yield_content("answer", answer_part): yield item
+                        else:
+                             async for item in yield_content(phase_cur, content): yield item
         except Exception:
             logger.exception("Stream error"); raise
 
-    # ---------- non-stream (REBUILT) ----------
+    # ---------- non-stream (REBUILT WITH STATE MACHINE) ----------
     async def non_stream_proxy_response(self, req: ChatCompletionRequest) -> ChatCompletionResponse:
         ck = None
         try:
             body, headers, ck = await self._prep_upstream(req)
-            think_buf = []
-            answer_buf = []
+            raw_thinking_parts = []
+            raw_answer_parts = []
             phase_cur = None
 
             async with self.client.stream("POST", settings.UPSTREAM_URL, json=body, headers=headers) as resp:
@@ -179,29 +133,41 @@ class ProxyHandler:
                         except (json.JSONDecodeError, AttributeError): continue
                         
                         new_phase = dat.get("phase")
-                        if new_phase:
-                            phase_cur = new_phase
-                        
-                        # Use the unified parser
-                        parsed_parts = self._parse_chunk(dat)
+                        if new_phase: phase_cur = new_phase
+                        if not phase_cur: continue
 
-                        for part_type, part_content in parsed_parts:
-                            if part_type == "thinking":
-                                think_buf.append(part_content)
-                            elif part_type == "answer":
-                                answer_buf.append(part_content)
+                        content = dat.get("delta_content") or dat.get("edit_content")
+                        if not content: continue
+                        
+                        # Remove tool call blocks
+                        content = re.sub(r'<glm_block.*?</glm_block>', '', content, flags=re.DOTALL)
+
+                        # Handle mixed content from edit_content by splitting it
+                        match = re.search(r'(.*</details>)(.*)', content, flags=re.DOTALL)
+                        if match:
+                            thinking_part, answer_part = match.groups()
+                            raw_thinking_parts.append(thinking_part)
+                            raw_answer_parts.append(answer_part)
+                        else:
+                            if phase_cur == "thinking":
+                                raw_thinking_parts.append(content)
+                            elif phase_cur == "answer":
+                                raw_answer_parts.append(content)
                     else: continue
                     break
-            
-            # Post-process collected buffers
-            final_ans_text = ''.join(answer_buf)
+
+            # Final assembly and cleaning
+            final_ans_text = ''.join(raw_answer_parts)
             final_content = final_ans_text
 
-            if settings.SHOW_THINK_TAGS and think_buf:
-                # Clean the thinking part at the very end
-                final_think_text = self._clean_html_and_quotes(''.join(think_buf)).strip()
-                if final_think_text:
-                    final_content = f"<think>{final_think_text}</think>{final_ans_text}"
+            if settings.SHOW_THINK_TAGS and raw_thinking_parts:
+                full_think_text = ''.join(raw_thinking_parts)
+                # Clean HTML tags and quotes from thinking part
+                cleaned_think_text = re.sub(r'<[^>]+>', '', full_think_text)
+                cleaned_think_text = re.sub(r'^\s*>\s*', '', cleaned_think_text, flags=re.MULTILINE).strip()
+                
+                if cleaned_think_text:
+                    final_content = f"<think>{cleaned_think_text}</think>{final_ans_text}"
 
             return ChatCompletionResponse(
                 id=f"chatcmpl-{uuid.uuid4().hex[:29]}", created=int(time.time()), model=req.model,
