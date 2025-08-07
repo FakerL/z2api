@@ -44,7 +44,7 @@ class ProxyHandler:
         headers = { "Content-Type": "application/json", "Authorization": f"Bearer {ck}", "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"), "Accept": "application/json, text/event-stream", "Accept-Language": "zh-CN", "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"', "sec-ch-ua-mobile": "?0", "sec-ch-ua-platform": '"macOS"', "x-fe-version": "prod-fe-1.0.53", "Origin": "https://chat.z.ai", "Referer": "https://chat.z.ai/",}
         return body, headers, ck
 
-    # ---------- stream (REBUILT WITH STATE MACHINE) ----------
+    # The stream_proxy_response from v6 remains the same, as it was working correctly.
     async def stream_proxy_response(self, req: ChatCompletionRequest) -> AsyncGenerator[str, None]:
         ck = None
         try:
@@ -59,7 +59,12 @@ class ProxyHandler:
                     if not think_open:
                         yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': '<think>'}, 'finish_reason': None}]})}\n\n"
                         think_open = True
-                    yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': text}, 'finish_reason': None}]})}\n\n"
+                    # In stream, we clean as we go
+                    cleaned_text = re.sub(r'<glm_block.*?</glm_block>', '', text, flags=re.DOTALL)
+                    cleaned_text = re.sub(r'<[^>]+>', '', cleaned_text)
+                    cleaned_text = re.sub(r'^\s*>\s*', '', cleaned_text, flags=re.MULTILINE)
+                    if cleaned_text:
+                        yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': cleaned_text}, 'finish_reason': None}]})}\n\n"
                 elif content_type == "answer":
                     if think_open:
                         yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': '</think>'}, 'finish_reason': None}]})}\n\n"
@@ -93,10 +98,6 @@ class ProxyHandler:
                         content = dat.get("delta_content") or dat.get("edit_content")
                         if not content: continue
 
-                        # Remove tool call blocks
-                        content = re.sub(r'<glm_block.*?</glm_block>', '', content, flags=re.DOTALL)
-                        
-                        # Handle mixed content from edit_content
                         match = re.search(r'(.*</details>)(.*)', content, flags=re.DOTALL)
                         if match:
                             thinking_part, answer_part = match.groups()
@@ -107,7 +108,7 @@ class ProxyHandler:
         except Exception:
             logger.exception("Stream error"); raise
 
-    # ---------- non-stream (REBUILT WITH STATE MACHINE) ----------
+    # ---------- non-stream (REVISED CLEANUP LOGIC) ----------
     async def non_stream_proxy_response(self, req: ChatCompletionRequest) -> ChatCompletionResponse:
         ck = None
         try:
@@ -139,10 +140,8 @@ class ProxyHandler:
                         content = dat.get("delta_content") or dat.get("edit_content")
                         if not content: continue
                         
-                        # Remove tool call blocks
                         content = re.sub(r'<glm_block.*?</glm_block>', '', content, flags=re.DOTALL)
 
-                        # Handle mixed content from edit_content by splitting it
                         match = re.search(r'(.*</details>)(.*)', content, flags=re.DOTALL)
                         if match:
                             thinking_part, answer_part = match.groups()
@@ -162,12 +161,24 @@ class ProxyHandler:
 
             if settings.SHOW_THINK_TAGS and raw_thinking_parts:
                 full_think_text = ''.join(raw_thinking_parts)
-                # Clean HTML tags and quotes from thinking part
-                cleaned_think_text = re.sub(r'<[^>]+>', '', full_think_text)
-                cleaned_think_text = re.sub(r'^\s*>\s*', '', cleaned_think_text, flags=re.MULTILINE).strip()
                 
-                if cleaned_think_text:
-                    final_content = f"<think>{cleaned_think_text}</think>{final_ans_text}"
+                # --- START OF FINAL FIX ---
+                # 1. Remove all HTML-like tags first. This gets rid of <details>, <summary>, etc.
+                cleaned_text = re.sub(r'<[^>]+>', '', full_think_text)
+                
+                # 2. Remove specific known metadata patterns that are not standard HTML.
+                # This pattern matches 'true" duration="...">' and "Thought for ... seconds"
+                cleaned_text = re.sub(r'true" duration="\d+">\s*Thought for \d+ seconds', '', cleaned_text)
+
+                # 3. Remove leading markdown quote symbols and trim whitespace.
+                cleaned_text = re.sub(r'^\s*>\s*', '', cleaned_text, flags=re.MULTILINE).strip()
+
+                # 4. Remove any remaining "Thinking..." headers.
+                cleaned_text = cleaned_text.replace("Thinking…", "").strip()
+                # --- END OF FINAL FIX ---
+
+                if cleaned_text:
+                    final_content = f"<think>{cleaned_text}</think>{final_ans_text}"
 
             return ChatCompletionResponse(
                 id=f"chatcmpl-{uuid.uuid4().hex[:29]}", created=int(time.time()), model=req.model,
