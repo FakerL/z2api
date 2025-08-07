@@ -49,14 +49,14 @@ class ProxyHandler:
 
     def _clean_answer_content(self, text: str) -> str:
         """
-        Cleans only <glm_block> tags from the final answer content,
-        preserving other potential markdown or HTML formatting.
+        Cleans only <glm_block> tags from answer content.
+        Does NOT strip whitespace to preserve markdown in streams.
         """
         if not text:
             return ""
         # Remove only tool call blocks
         cleaned_text = re.sub(r'<glm_block.*?</glm_block>', '', text, flags=re.DOTALL)
-        return cleaned_text.strip()
+        return cleaned_text # <-- FIX: Removed .strip() to preserve whitespace in chunks
 
     def _serialize_msgs(self, msgs) -> list:
         """Converts message objects to a list of dictionaries."""
@@ -85,29 +85,34 @@ class ProxyHandler:
 
             async def yield_content(content_type: str, text: str):
                 nonlocal think_open
-                if not text: return
                 
                 # Apply cleaning based on content type
                 cleaned_text = ""
                 if content_type == "thinking":
                     cleaned_text = self._clean_thinking_content(text)
                 elif content_type == "answer":
+                    # Use the non-stripping cleaner for stream chunks
                     cleaned_text = self._clean_answer_content(text)
 
-                if not cleaned_text: return
+                if not cleaned_text and not (content_type == "answer" and text):
+                    # For answer, even if cleaning results in empty (e.g. only a glm_block), 
+                    # the original might have been just whitespace, so we allow it to pass if text was present.
+                    # This logic is now simpler: if there's no text, don't yield.
+                    if not text: return
 
                 if content_type == "thinking" and settings.SHOW_THINK_TAGS:
                     if not think_open:
                         yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': '<think>'}, 'finish_reason': None}]})}\n\n"
                         think_open = True
-                    
-                    yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': cleaned_text}, 'finish_reason': None}]})}\n\n"
+                    if cleaned_text:
+                        yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': cleaned_text}, 'finish_reason': None}]})}\n\n"
                 
                 elif content_type == "answer":
                     if think_open:
                         yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': '</think>'}, 'finish_reason': None}]})}\n\n"
                         think_open = False
                     
+                    # Yield the cleaned text, which now preserves crucial whitespace
                     yield f"data: {json.dumps({'id': comp_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': req.model, 'choices': [{'index': 0, 'delta': {'content': cleaned_text}, 'finish_reason': None}]})}\n\n"
 
             async with self.client.stream("POST", settings.UPSTREAM_URL, json=body, headers=headers) as resp:
@@ -190,8 +195,9 @@ class ProxyHandler:
                     else: continue
                     break
 
-            # Clean the final answer text, removing only <glm_block> tags.
-            cleaned_ans_text = self._clean_answer_content(''.join(raw_answer_parts))
+            # Clean the joined answer text, then strip the final result.
+            full_answer = ''.join(raw_answer_parts)
+            cleaned_ans_text = self._clean_answer_content(full_answer).strip() # <-- FIX: Apply .strip() here
             final_content = cleaned_ans_text
             
             if settings.SHOW_THINK_TAGS and raw_thinking_parts:
