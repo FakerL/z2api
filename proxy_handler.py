@@ -28,13 +28,7 @@ class ProxyHandler:
 
     # ---------- text utilities ----------
     def _balance_think_tag(self, txt: str) -> str:
-        # ensure
-
-<details type="reasoning" done="true" duration="0">
-<summary>Thought for 0 seconds</summary>
-> and
-</details>
-count match
+        # ensure opens and closes count match
         opens = len(re.findall(r"<think>", txt))
         closes = len(re.findall(r"</think>", txt))
         if opens > closes:
