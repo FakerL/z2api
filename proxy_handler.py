@@ -27,7 +27,7 @@ class ProxyHandler:
         if not self.client.is_closed:
             await self.client.aclose()
 
-    # --- Text utilities (REVISED _clean_answer_from_edit) ---
+    # --- Text utilities (REVISED _clean_answer) ---
     def _clean_thinking(self, s: str) -> str:
         if not s: return ""
         s = re.sub(r'<details[^>]*>.*?</details>', '', s, flags=re.DOTALL)
@@ -44,15 +44,15 @@ class ProxyHandler:
         if not s: return ""
         
         if from_edit_content:
-            # Find the position of the last </details> tag
             last_details_pos = s.rfind('</details>')
             if last_details_pos != -1:
-                # Extract everything after the tag
                 s = s[last_details_pos + len('</details>'):]
         
-        # General cleanup for any remaining <details> blocks (just in case)
         s = re.sub(r"<details[^>]*>.*?</details>", "", s, flags=re.DOTALL)
-        return s.lstrip() # Use lstrip to remove leading whitespace like '\n' but keep internal space
+        
+        # FIX: Use a more specific lstrip to only remove leading newlines,
+        # but preserve leading spaces which are important for markdown.
+        return s.lstrip('\n\r')
 
     # ... Other methods like _serialize_msgs, _prep_upstream remain the same ...
     def _serialize_msgs(self, msgs) -> list:
@@ -76,10 +76,7 @@ class ProxyHandler:
         ck = None
         try:
             body, headers, ck = await self._prep_upstream(req)
-            comp_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-            think_open = False
-            phase_cur = None
-
+            comp_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"; think_open = False; phase_cur = None
             async with self.client.stream("POST", settings.UPSTREAM_URL, json=body, headers=headers) as resp:
                 if resp.status_code != 200:
                     await cookie_manager.mark_cookie_failed(ck); err_body = await resp.aread()
@@ -100,7 +97,6 @@ class ProxyHandler:
                             dat = json.loads(payload_str).get("data", {})
                         except (json.JSONDecodeError, AttributeError): continue
                         
-                        # FIX: Differentiate content source
                         is_edit = "edit_content" in dat
                         content = dat.get("delta_content", "") or dat.get("edit_content", "")
                         new_phase = dat.get("phase")
@@ -124,7 +120,6 @@ class ProxyHandler:
                                     think_open = True
                                 text_to_yield = self._clean_thinking(content)
                         elif current_content_phase == "answer":
-                            # FIX: Use the new cleaning logic
                             text_to_yield = self._clean_answer(content, from_edit_content=is_edit)
 
                         if text_to_yield:
@@ -140,13 +135,11 @@ class ProxyHandler:
             body, headers, ck = await self._prep_upstream(req)
             full_content = []
             phase_cur = None
-
             async with self.client.stream("POST", settings.UPSTREAM_URL, json=body, headers=headers) as resp:
                 if resp.status_code != 200:
                     await cookie_manager.mark_cookie_failed(ck); error_detail = await resp.text()
                     raise HTTPException(resp.status_code, f"Upstream error: {error_detail}")
                 await cookie_manager.mark_cookie_success(ck)
-                
                 async for raw in resp.aiter_text():
                     for line in raw.strip().split('\n'):
                         line = line.strip()
@@ -156,14 +149,11 @@ class ProxyHandler:
                         try:
                             dat = json.loads(payload_str).get("data", {})
                         except (json.JSONDecodeError, AttributeError): continue
-                        
                         is_edit = "edit_content" in dat
                         content = dat.get("delta_content") or dat.get("edit_content")
                         new_phase = dat.get("phase")
-                        
                         if new_phase: phase_cur = new_phase
                         if content and phase_cur:
-                            # Store the content along with its source (is_edit)
                             full_content.append((phase_cur, content, is_edit))
                     else: continue
                     break
@@ -174,16 +164,14 @@ class ProxyHandler:
                 if phase == "thinking":
                     think_buf.append(self._clean_thinking(content))
                 elif phase == "answer":
-                    # FIX: Use the new cleaning logic
                     answer_buf.append(self._clean_answer(content, from_edit_content=is_edit))
             
             ans_text = ''.join(answer_buf)
             final_content = ans_text
-
             if settings.SHOW_THINK_TAGS and think_buf:
                 think_text = ''.join(think_buf).strip()
                 if think_text:
-                    # No longer need to manually add newline, as .lstrip() in _clean_answer handles it
+                    # The newline is handled by the answer itself now, so we can just concatenate.
                     final_content = f"<think>{think_text}</think>{ans_text}"
 
             return ChatCompletionResponse(
