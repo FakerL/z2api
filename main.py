@@ -92,10 +92,10 @@ async def list_models():
     """List available models"""
     models = [
         ModelInfo(
-            id=settings.MODEL_ID,  # 建議使用 settings.MODEL_NAME 以保持一致性
+            id=model,
             object="model",
             owned_by="z-ai"
-        )
+        ) for model in settings.UPSTREAM_MODELS.keys()
     ]
     return ModelsResponse(data=models)
 
@@ -112,10 +112,10 @@ async def chat_completions(
                 detail="Service unavailable: No Z.AI cookies configured. Please set Z_AI_COOKIES environment variable."
             )
 
-        if request.model != settings.MODEL_NAME:
+        if request.model not in settings.UPSTREAM_MODELS:
             raise HTTPException(
-                status_code=400,
-                detail=f"Model '{request.model}' not supported. Use '{settings.MODEL_NAME}'"
+                status_code=404,
+                detail=f"Model '{request.model}' not found."
             )
 
         # --- MODIFICATION START ---
@@ -138,7 +138,7 @@ async def chat_completions(
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    return {"status": "healthy", "model": settings.MODEL_NAME}
+    return {"status": "healthy"}
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):

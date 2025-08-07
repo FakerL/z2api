@@ -21,6 +21,7 @@ class ChatCompletionRequest(BaseModel):
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None
     user: Optional[str] = None
+    thinking: Optional[dict] = {}
 
 class ChatCompletionChoice(BaseModel):
     index: int

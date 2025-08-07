@@ -72,8 +72,11 @@ class ProxyHandler:
         """Prepares the request body, headers, and cookie for the upstream API."""
         ck = await cookie_manager.get_next_cookie()
         if not ck: raise HTTPException(503, "No available cookies")
-        model = settings.UPSTREAM_MODEL if req.model == settings.MODEL_NAME else req.model
-        body = { "stream": True, "model": model, "messages": self._serialize_msgs(req.messages), "background_tasks": {"title_generation": True, "tags_generation": True}, "chat_id": str(uuid.uuid4()), "features": {"image_generation": False, "code_interpreter": False, "web_search": False, "auto_web_search": False, "enable_thinking": True,}, "id": str(uuid.uuid4()), "mcp_servers": ["deep-web-search"], "model_item": {"id": model, "name": "GLM-4.5", "owned_by": "openai"}, "params": {}, "tool_servers": [], "variables": {"{{USER_NAME}}": "User", "{{USER_LOCATION}}": "Unknown", "{{CURRENT_DATETIME}}": time.strftime("%Y-%m-%d %H:%M:%S"),},}
+        model = settings.UPSTREAM_MODELS[req.model]
+        thinking = True if req.thinking.get('type', 'enabled') == 'enabled' else False
+        body = { "stream": True, "model": model, "messages": self._serialize_msgs(req.messages), "chat_id": str(uuid.uuid4()), "features": {"image_generation": False, "code_interpreter": False, "web_search": False, "auto_web_search": False, "preview_mode": False, "enable_thinking": thinking}, "id": str(uuid.uuid4()), "params": {}, "tool_servers": [], "variables": {"{{USER_NAME}}": "User", "{{USER_LOCATION}}": "Unknown", "{{CURRENT_DATETIME}}": time.strftime("%Y-%m-%d %H:%M:%S"),},}
+        # DeepResearch
+        # body["mcp_servers"] = ["deep-web-search"]
         headers = { "Content-Type": "application/json", "Authorization": f"Bearer {ck}", "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36"), "Accept": "application/json, text/event-stream", "Accept-Language": "zh-CN", "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"', "sec-ch-ua-mobile": "?0", "sec-ch-ua-platform": '"macOS"', "x-fe-version": "prod-fe-1.0.53", "Origin": "https://chat.z.ai", "Referer": "https://chat.z.ai/",}
         return body, headers, ck
         
@@ -146,10 +149,10 @@ class ProxyHandler:
                         match = re.search(r'(.*</details>)(.*)', content, flags=re.DOTALL)
                         if match:
                             thinking_part, answer_part = match.groups()
-                            async for item in yield_content("thinking", thinking_part): yield item
+                            # async for item in yield_content("thinking", thinking_part): yield item
                             async for item in yield_content("answer", answer_part): yield item
                         else:
-                             async for item in yield_content(phase_cur, content): yield item
+                            async for item in yield_content(phase_cur, content): yield item
         except Exception:
             logger.exception("Stream error"); raise
 
@@ -185,7 +188,7 @@ class ProxyHandler:
                         match = re.search(r'(.*</details>)(.*)', content, flags=re.DOTALL)
                         if match:
                             thinking_part, answer_part = match.groups()
-                            raw_thinking_parts.append(thinking_part)
+                            # raw_thinking_parts.append(thinking_part)
                             raw_answer_parts.append(answer_part)
                         else:
                             if phase_cur == "thinking":

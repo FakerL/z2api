@@ -14,11 +14,10 @@ class Settings:
 
     # Z.AI settings
     UPSTREAM_URL: str = "https://chat.z.ai/api/chat/completions"
-    UPSTREAM_MODEL: str = "0727-360B-API"
-
-    # Model settings (OpenAI SDK compatible)
-    MODEL_NAME: str = "GLM-4.5"
-    MODEL_ID: str = "GLM-4.5"
+    UPSTREAM_MODELS: dict = {
+        "GLM-4.5": "0727-360B-API",
+        "GLM-4.5-Air": "0727-106B-API",
+    }
 
     # API Key for external authentication
     API_KEY: str = os.getenv("API_KEY", "sk-z2api-key-2024")
